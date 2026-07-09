@@ -27,7 +27,7 @@ export default function SaaSSidebar() {
           </span>
           <nav className="space-y-1.5">
             <NavLink
-              to="/studio"
+              to="/script-studio"
               className={({ isActive }) =>
                 `flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 group cursor-pointer ${
                   isActive
@@ -37,8 +37,21 @@ export default function SaaSSidebar() {
               }
             >
               <Video className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
-              <span>Create Video</span>
-              <span className="ml-auto flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              <span>AI Script to Video</span>
+            </NavLink>
+
+            <NavLink
+              to="/studio"
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 group cursor-pointer ${
+                  isActive
+                    ? "bg-indigo-600/10 text-indigo-400 border-l-4 border-indigo-500 shadow-[inset_4px_0_12px_rgba(99,102,241,0.05)]"
+                    : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60"
+                }`
+              }
+            >
+              <Sparkles className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
+              <span>AI Advanced Studio</span>
             </NavLink>
 
             <NavLink

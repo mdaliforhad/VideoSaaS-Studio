@@ -137,7 +137,11 @@ export default function LiveStreamerPage() {
           if (active) {
             const combined = [...list, ...defaultDemos];
             setGalleryVideos(combined);
-            if (combined.length > 0) {
+            const queryParams = new URLSearchParams(window.location.search);
+            const videoIdParam = queryParams.get("videoId");
+            if (videoIdParam && combined.some(v => v.id === videoIdParam)) {
+              setSelectedVideoId(videoIdParam);
+            } else if (combined.length > 0) {
               setSelectedVideoId(combined[0].id);
             }
           }
@@ -145,14 +149,26 @@ export default function LiveStreamerPage() {
           console.error("Failed to load compiled videos in streamer page:", err);
           if (active) {
             setGalleryVideos(defaultDemos);
-            setSelectedVideoId(defaultDemos[0].id);
+            const queryParams = new URLSearchParams(window.location.search);
+            const videoIdParam = queryParams.get("videoId");
+            if (videoIdParam && defaultDemos.some(v => v.id === videoIdParam)) {
+              setSelectedVideoId(videoIdParam);
+            } else {
+              setSelectedVideoId(defaultDemos[0].id);
+            }
           }
         } finally {
           if (active) setIsLoadingVideos(false);
         }
       } else {
+        const queryParams = new URLSearchParams(window.location.search);
+        const videoIdParam = queryParams.get("videoId");
+        if (videoIdParam && defaultDemos.some(v => v.id === videoIdParam)) {
+          setSelectedVideoId(videoIdParam);
+        } else {
+          setSelectedVideoId(defaultDemos[0].id);
+        }
         setGalleryVideos(defaultDemos);
-        setSelectedVideoId(defaultDemos[0].id);
         setIsLoadingVideos(false);
       }
     };

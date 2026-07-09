@@ -2,6 +2,7 @@ import React from "react";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import LandingPage from "./pages/LandingPage";
 import StudioDashboard from "./pages/StudioDashboard";
+import MultiModalStudio from "./pages/MultiModalStudio";
 import VideoGallery from "./pages/VideoGallery";
 import LiveStreamerPage from "./pages/LiveStreamerPage";
 import PricingPage from "./pages/PricingPage";
@@ -18,6 +19,14 @@ export default function App() {
           <Route path="/login" element={<LoginPage />} />
           <Route 
             path="/studio" 
+            element={
+              <ProtectedRoute>
+                <MultiModalStudio />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/script-studio" 
             element={
               <ProtectedRoute>
                 <StudioDashboard />
