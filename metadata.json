@@ -1,0 +1,6 @@
+{
+  "name": "Script to Video Studio",
+  "description": "An AI-powered video scriptwriter and production workspace that designs engaging multi-scene scripts with synchronized captions, stock video search keys, and real-time audio narration previews.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

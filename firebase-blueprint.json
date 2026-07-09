@@ -1,0 +1,86 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "Unique video shorts script project",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique UUID of the project"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Authenticated user UID"
+        },
+        "video_title": {
+          "type": "string",
+          "description": "Title of the video script"
+        },
+        "language": {
+          "type": "string",
+          "description": "Output language of the script"
+        },
+        "aspectRatio": {
+          "type": "string",
+          "description": "Target video aspect ratio format (9:16 or 16:9)"
+        },
+        "tone": {
+          "type": "string",
+          "description": "Mood tone of the generated voiceover narration"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp of project creation in ISO string format"
+        },
+        "scenes": {
+          "type": "array",
+          "description": "List of structural storyboard scenes with visual and audio metadata"
+        }
+      },
+      "required": ["id", "userId", "video_title", "createdAt", "scenes"]
+    },
+    "CompiledVideo": {
+      "title": "CompiledVideo",
+      "description": "Successfully compiled video metadata",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique job or compilation ID of the video"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Authenticated user UID"
+        },
+        "video_title": {
+          "type": "string",
+          "description": "Title of the compiled video"
+        },
+        "video_url": {
+          "type": "string",
+          "description": "Local API proxy URL to fetch or download the video payload"
+        },
+        "aspectRatio": {
+          "type": "string",
+          "description": "Video rendering format (9:16 or 16:9)"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp of compilation in ISO string format"
+        }
+      },
+      "required": ["id", "userId", "video_title", "video_url", "aspectRatio", "createdAt"]
+    }
+  },
+  "firestore": {
+    "projects/{projectId}": {
+      "schema": "Project",
+      "description": "User shorts scripts and custom edits"
+    },
+    "compiled_videos/{compiledVideoId}": {
+      "schema": "CompiledVideo",
+      "description": "User compiled/completed shorts renders"
+    }
+  }
+}
