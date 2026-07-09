@@ -46,34 +46,6 @@ export default function MultiModalStudio() {
   // Dashboard states
   const [activeTab, setActiveTab] = useState<"t2v" | "i2v" | "f2v">("t2v");
   const [activeVideo, setActiveVideo] = useState<CompiledVideo | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (activeVideo && activeVideo.video_url) {
-      if (activeVideo.video_url.startsWith("http")) {
-        setVideoUrl(activeVideo.video_url);
-      } else {
-        // Fetch as blob
-        fetch(activeVideo.video_url)
-          .then(res => res.blob())
-          .then(blob => {
-            setVideoUrl(URL.createObjectURL(blob));
-          })
-          .catch(err => {
-            console.error("Failed to fetch video blob:", err);
-            setVideoUrl(activeVideo.video_url);
-          });
-      }
-    } else {
-      setVideoUrl(null);
-    }
-    
-    return () => {
-      if (videoUrl && videoUrl.startsWith("blob:")) {
-        URL.revokeObjectURL(videoUrl);
-      }
-    };
-  }, [activeVideo]);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [genLogs, setGenLogs] = useState<string[]>([]);
@@ -847,16 +819,16 @@ export default function MultiModalStudio() {
 
                 {/* Video screen box */}
                 <div className="flex-1 bg-zinc-900/30 flex items-center justify-center p-6 relative min-h-[250px]">
-                  {activeVideo ? (
+                      {activeVideo ? (
                     <div className="w-full max-w-xl aspect-video rounded-xl overflow-hidden border border-zinc-800 bg-black shadow-lg relative group">
                       <video
-                        key={videoUrl || activeVideo.video_url}
-                        src={videoUrl || activeVideo.video_url}
+                        src={activeVideo.video_url}
                         controls
                         autoPlay
                         muted
                         loop
-                        className="w-full h-full object-contain"
+                        className="w-full h-full object-contain rounded-lg bg-zinc-950"
+                        key={activeVideo.video_url}
                       />
                     </div>
                   ) : isGenerating ? (
