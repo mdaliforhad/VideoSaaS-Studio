@@ -26,7 +26,7 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import SaaSSidebar from "../components/SaaSSidebar";
 import { useAuth } from "../components/AuthProvider";
-import { db, handleFirestoreError, OperationType } from "../lib/firebase";
+import { auth, db, handleFirestoreError, OperationType } from "../lib/firebase";
 import { collection, doc, setDoc } from "firebase/firestore";
 
 interface CompiledVideo {
@@ -161,9 +161,16 @@ export default function MultiModalStudio() {
     runSimulatedLogs(logSteps, 900);
 
     try {
+      if (!user) {
+        throw new Error("You must be logged in to generate videos.");
+      }
+      const token = await user.getIdToken();
       const response = await fetch("/api/generate-text-to-video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({ prompt: t2vPrompt, model: t2vModel })
       });
 
@@ -205,9 +212,16 @@ export default function MultiModalStudio() {
     runSimulatedLogs(logSteps, 1000);
 
     try {
+      if (!user) {
+        throw new Error("You must be logged in to generate videos.");
+      }
+      const token = await user.getIdToken();
       const response = await fetch("/api/generate-image-to-video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({ 
           image: i2vImage, 
           filename: i2vImageFilename, 
@@ -254,9 +268,16 @@ export default function MultiModalStudio() {
     runSimulatedLogs(logSteps, 850);
 
     try {
+      if (!user) {
+        throw new Error("You must be logged in to generate videos.");
+      }
+      const token = await user.getIdToken();
       const response = await fetch("/api/compile-frames-to-video", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify({ frames: f2vFiles, fps: f2vFps })
       });
 

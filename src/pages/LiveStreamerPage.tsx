@@ -15,42 +15,27 @@ import {
   AlertCircle,
   TrendingUp,
   RefreshCw,
-  Cloud
+  Cloud,
+  Search,
+  Copy,
+  Download,
+  Tag,
+  Image,
+  Sparkles
 } from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence } from "framer-motion"; // Fixed import path
 import SaaSSidebar from "../components/SaaSSidebar";
 import Navbar from "../components/Navbar";
 import { useAuth } from "../components/AuthProvider";
 import { db } from "../lib/firebase";
 import { collection, query, where, getDocs } from "firebase/firestore";
 
-interface CompiledVideo {
-  id: string;
-  video_title: string;
-  video_url: string;
-  aspectRatio: string;
-  createdAt: string;
-  isDemo?: boolean;
-}
-
 export default function LiveStreamerPage() {
   const { user } = useAuth();
-  const [galleryVideos, setGalleryVideos] = useState<CompiledVideo[]>([]);
-  const [isLoadingVideos, setIsLoadingVideos] = useState(false);
   
   // Form states initialized directly from localStorage
-  const [videoSourceType, setVideoSourceType] = useState<"gallery" | "custom" | "drive">(() => {
-    const saved = localStorage.getItem("stream_videoSourceType");
-    return (saved === "gallery" || saved === "custom" || saved === "drive") ? saved : "gallery";
-  });
-  const [selectedVideoId, setSelectedVideoId] = useState<string>(() => {
-    return localStorage.getItem("stream_selectedVideoId") || "";
-  });
-  const [customVideoUrl, setCustomVideoUrl] = useState<string>(() => {
-    return localStorage.getItem("stream_customVideoUrl") || "";
-  });
-  const [driveVideoUrl, setDriveVideoUrl] = useState<string>(() => {
-    return localStorage.getItem("stream_driveVideoUrl") || "";
+  const [videoUrl, setVideoUrl] = useState<string>(() => {
+    return localStorage.getItem("stream_videoUrl") || "";
   });
   const [rtmpUrl, setRtmpUrl] = useState<string>(() => {
     return localStorage.getItem("stream_rtmpUrl") || "rtmp://a.rtmp.youtube.com/live2";
@@ -58,8 +43,17 @@ export default function LiveStreamerPage() {
   const [streamKey, setStreamKey] = useState<string>(() => {
     return localStorage.getItem("stream_streamKey") || "";
   });
+  const [youtubeCookies, setYoutubeCookies] = useState<string>(() => {
+    return localStorage.getItem("stream_youtubeCookies") || "";
+  });
   const [showKey, setShowKey] = useState(false);
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
+  const [showCookiesConfig, setShowCookiesConfig] = useState(false);
 
+  useEffect(() => {
+    localStorage.setItem("stream_youtubeCookies", youtubeCookies);
+  }, [youtubeCookies]);
+  
   // Status states from backend
   const [streamStatus, setStreamStatus] = useState({
     isLive: false,
@@ -67,27 +61,80 @@ export default function LiveStreamerPage() {
     videoSource: "",
     rtmpUrl: "",
     activeVideoTitle: "",
-    streamToken: ""
+    streamToken: "",
+    errorLog: [] as string[],
+    lastCrashReason: ""
   });
+  const [loopMode, setLoopMode] = useState<"none" | "infinite">("infinite");
+  const [isActionLoading, setIsActionLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+
+  const sseRef = useRef<EventSource | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const statusPollInterval = useRef<NodeJS.Timeout | null>(null);
+
+  const disconnectKeepAlive = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (sseRef.current) {
+      console.log("[Keep-Alive] Closing keep-alive SSE connection.");
+      sseRef.current.close();
+      sseRef.current = null;
+    }
+  };
+
+  const connectKeepAlive = () => {
+    disconnectKeepAlive();
+    console.log("[Keep-Alive] Opening keep-alive SSE connection to maintain container activity.");
+    const sse = new EventSource("/api/stream/keep-alive");
+    sseRef.current = sse;
+    sse.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.status === "ping" || data.status === "connected") {
+          console.log("[Keep-Alive] Heartbeat ping received:", data.timestamp);
+        }
+      } catch (err) {}
+    };
+    sse.onerror = (err) => {
+      console.warn("[Keep-Alive] SSE connection error or closed. Reconnecting in 3 seconds...", err);
+      sse.close();
+      if (sseRef.current === sse) {
+        sseRef.current = null;
+      }
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = setTimeout(() => {
+        const hasToken = localStorage.getItem("stream_activeToken");
+        if (hasToken) {
+          connectKeepAlive();
+        }
+      }, 3000);
+    };
+  };
+
+  // Keep-alive connection synchronization
+  useEffect(() => {
+    const activeToken = localStorage.getItem("stream_activeToken") || streamStatus.streamToken;
+    if (activeToken && streamStatus.isLive && !sseRef.current) {
+      connectKeepAlive();
+    } else if (!streamStatus.isLive && sseRef.current) {
+      disconnectKeepAlive();
+    }
+  }, [streamStatus.isLive]);
+
+  useEffect(() => {
+    return () => {
+      disconnectKeepAlive();
+    };
+  }, []);
 
   // Sync state changes to localStorage
   useEffect(() => {
-    localStorage.setItem("stream_videoSourceType", videoSourceType);
-  }, [videoSourceType]);
-
-  useEffect(() => {
-    if (selectedVideoId) {
-      localStorage.setItem("stream_selectedVideoId", selectedVideoId);
-    }
-  }, [selectedVideoId]);
-
-  useEffect(() => {
-    localStorage.setItem("stream_customVideoUrl", customVideoUrl);
-  }, [customVideoUrl]);
-
-  useEffect(() => {
-    localStorage.setItem("stream_driveVideoUrl", driveVideoUrl);
-  }, [driveVideoUrl]);
+    localStorage.setItem("stream_videoUrl", videoUrl);
+  }, [videoUrl]);
 
   useEffect(() => {
     localStorage.setItem("stream_rtmpUrl", rtmpUrl);
@@ -96,87 +143,6 @@ export default function LiveStreamerPage() {
   useEffect(() => {
     localStorage.setItem("stream_streamKey", streamKey);
   }, [streamKey]);
-  const [isActionLoading, setIsActionLoading] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
-
-  // Poll status interval
-  const statusPollInterval = useRef<NodeJS.Timeout | null>(null);
-
-  // Default demo videos as fallback
-  const defaultDemos: CompiledVideo[] = [
-    {
-      id: "demo-1",
-      video_title: "5 Mind-Bending Space Facts Everyone Ignores",
-      video_url: "https://assets.mixkit.co/videos/preview/mixkit-galaxy-exploration-with-a-spaceship-42993-large.mp4",
-      aspectRatio: "16:9",
-      createdAt: new Date().toISOString()
-    },
-    {
-      id: "demo-2",
-      video_title: "The Ultimate Guide to Passive SaaS Income",
-      video_url: "https://assets.mixkit.co/videos/preview/mixkit-mysterious-pills-falling-in-neon-vertical-video-45136-large.mp4",
-      aspectRatio: "9:16",
-      createdAt: new Date().toISOString()
-    }
-  ];
-
-  // Fetch gallery videos
-  useEffect(() => {
-    let active = true;
-    const fetchGallery = async () => {
-      setIsLoadingVideos(true);
-      if (user) {
-        try {
-          const qObj = query(collection(db, "compiled_videos"), where("userId", "==", user.uid));
-          const snap = await getDocs(qObj);
-          const list: CompiledVideo[] = [];
-          snap.forEach((docSnap) => {
-            list.push({ id: docSnap.id, ...docSnap.data() } as CompiledVideo);
-          });
-          if (active) {
-            const combined = [...list, ...defaultDemos];
-            setGalleryVideos(combined);
-            const queryParams = new URLSearchParams(window.location.search);
-            const videoIdParam = queryParams.get("videoId");
-            if (videoIdParam && combined.some(v => v.id === videoIdParam)) {
-              setSelectedVideoId(videoIdParam);
-            } else if (combined.length > 0) {
-              setSelectedVideoId(combined[0].id);
-            }
-          }
-        } catch (err) {
-          console.error("Failed to load compiled videos in streamer page:", err);
-          if (active) {
-            setGalleryVideos(defaultDemos);
-            const queryParams = new URLSearchParams(window.location.search);
-            const videoIdParam = queryParams.get("videoId");
-            if (videoIdParam && defaultDemos.some(v => v.id === videoIdParam)) {
-              setSelectedVideoId(videoIdParam);
-            } else {
-              setSelectedVideoId(defaultDemos[0].id);
-            }
-          }
-        } finally {
-          if (active) setIsLoadingVideos(false);
-        }
-      } else {
-        const queryParams = new URLSearchParams(window.location.search);
-        const videoIdParam = queryParams.get("videoId");
-        if (videoIdParam && defaultDemos.some(v => v.id === videoIdParam)) {
-          setSelectedVideoId(videoIdParam);
-        } else {
-          setSelectedVideoId(defaultDemos[0].id);
-        }
-        setGalleryVideos(defaultDemos);
-        setIsLoadingVideos(false);
-      }
-    };
-    fetchGallery();
-    return () => {
-      active = false;
-    };
-  }, [user]);
 
   // Status Poller
   const fetchStreamStatus = async () => {
@@ -192,7 +158,6 @@ export default function LiveStreamerPage() {
         }
       }
     } catch (e) {
-      // Use warning level during development reboots to avoid clogging logs with transient fetch alerts
       console.warn("Stream status polling paused briefly during server reboot/network standby.");
     }
   };
@@ -226,34 +191,10 @@ export default function LiveStreamerPage() {
     setActionError(null);
     setActionSuccess(null);
 
-    // Pick correct source URL
-    let finalSourceUrl = "";
-    let finalTitle = "";
-    if (videoSourceType === "gallery") {
-      const selectedVideo = galleryVideos.find(v => v.id === selectedVideoId);
-      if (!selectedVideo) {
-        setActionError("Please select a video from your archive.");
-        setIsActionLoading(false);
-        return;
-      }
-      finalSourceUrl = selectedVideo.video_url;
-      finalTitle = selectedVideo.video_title;
-    } else if (videoSourceType === "drive") {
-      if (!driveVideoUrl.trim()) {
-        setActionError("Please insert a valid Google Drive video link.");
-        setIsActionLoading(false);
-        return;
-      }
-      finalSourceUrl = driveVideoUrl.trim();
-      finalTitle = "Google Drive Video";
-    } else {
-      if (!customVideoUrl.trim()) {
-        setActionError("Please insert a valid video URL or YouTube video URL.");
-        setIsActionLoading(false);
-        return;
-      }
-      finalSourceUrl = customVideoUrl.trim();
-      finalTitle = customVideoUrl;
+    if (!videoUrl.trim()) {
+      setActionError("Please enter a valid video URL.");
+      setIsActionLoading(false);
+      return;
     }
 
     if (!rtmpUrl.trim()) {
@@ -275,22 +216,26 @@ export default function LiveStreamerPage() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          videoSource: finalSourceUrl,
+          videoSource: videoUrl.trim(),
           rtmpUrl: rtmpUrl.trim(),
           streamKey: streamKey.trim(),
-          videoTitle: finalTitle
+          loopMode: loopMode,
+          youtubeCookies: youtubeCookies.trim()
         })
       });
-
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || "Failed to start background stream loop.");
       }
 
+      localStorage.setItem("stream_videoUrl", videoUrl.trim());
+      localStorage.setItem("stream_rtmpUrl", rtmpUrl.trim());
+      localStorage.setItem("stream_streamKey", streamKey.trim());
       if (data.status && data.status.streamToken) {
         localStorage.setItem("stream_activeToken", data.status.streamToken);
       }
 
+      connectKeepAlive();
       setActionSuccess("Success! Continuous background restream loop initiated.");
       fetchStreamStatus();
     } catch (err: any) {
@@ -303,14 +248,12 @@ export default function LiveStreamerPage() {
 
   // Stop stream action
   const handleStopStream = async () => {
-    if (!confirm("Are you sure you want to stop the 24/7 background stream? This will stop the live feed instantly.")) {
-      return;
-    }
     setIsActionLoading(true);
     setActionError(null);
     setActionSuccess(null);
 
     try {
+      disconnectKeepAlive();
       const activeToken = localStorage.getItem("stream_activeToken") || streamStatus.streamToken;
       const res = await fetch("/api/stream/stop", {
         method: "POST",
@@ -325,6 +268,7 @@ export default function LiveStreamerPage() {
       }
       localStorage.removeItem("stream_activeToken");
       setActionSuccess("Live restream stopped successfully.");
+      setShowStopConfirm(false);
       fetchStreamStatus();
     } catch (err: any) {
       console.error(err);
@@ -355,7 +299,8 @@ export default function LiveStreamerPage() {
               Continuous Restreamer
             </h1>
             <p className="text-zinc-500 text-xs sm:text-sm mt-1 max-w-2xl leading-relaxed">
-              Broadcast your compiled videos or third-party feeds directly to YouTube Live, Twitch, Kick, or custom RTMP destinations. Our persistent cloud-containers run continuous FFmpeg stream loops 24/7.
+              Broadcast your compiled videos or third-party feeds directly to YouTube Live, Twitch, Kick, or custom RTMP destinations.
+              Our persistent cloud-containers run continuous FFmpeg stream loops 24/7.
             </p>
           </div>
 
@@ -364,7 +309,7 @@ export default function LiveStreamerPage() {
             
             {/* Status Card */}
             <div className={`p-5 rounded-2xl border transition-all ${
-              streamStatus.isLive 
+                streamStatus.isLive 
                 ? "bg-emerald-950/20 border-emerald-500/30 shadow-[0_0_20px_rgba(16,185,129,0.05)]" 
                 : "bg-zinc-900/30 border-zinc-800"
             }`}>
@@ -447,115 +392,52 @@ export default function LiveStreamerPage() {
 
             <form onSubmit={handleStartStream} className="space-y-6">
               
-              {/* VIDEO SOURCE TYPE SELECTOR */}
+              {/* VIDEO SOURCE URL */}
               <div className="space-y-2">
-                <label className="text-xs font-bold text-zinc-300 uppercase tracking-wider block">1. Video Source</label>
-                
-                <div className="flex bg-zinc-950 p-1 rounded-xl border border-zinc-800 w-full md:w-fit flex-wrap gap-1 md:gap-0">
-                  <button
-                    type="button"
-                    onClick={() => setVideoSourceType("gallery")}
-                    className={`flex items-center gap-2 px-5 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      videoSourceType === "gallery" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                    }`}
-                  >
-                    <Film className="w-3.5 h-3.5" />
-                    Select from My Gallery
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVideoSourceType("custom")}
-                    className={`flex items-center gap-2 px-5 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      videoSourceType === "custom" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                    }`}
-                  >
-                    <LinkIcon className="w-3.5 h-3.5" />
-                    YouTube URL or Video Link
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVideoSourceType("drive")}
-                    className={`flex items-center gap-2 px-5 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
-                      videoSourceType === "drive" ? "bg-zinc-800 text-white shadow-sm" : "text-zinc-500 hover:text-zinc-300"
-                    }`}
-                  >
-                    <Cloud className="w-3.5 h-3.5" />
-                    Google Drive Link
-                  </button>
-                </div>
+                <label className="text-xs font-bold text-zinc-300 uppercase tracking-wider block">1. Video Source URL</label>
+                <input
+                  type="url"
+                  placeholder="Enter Video URL (YouTube, Twitch, or Direct Link)"
+                  value={videoUrl}
+                  onChange={(e) => setVideoUrl(e.target.value)}
+                  className="w-full px-4 py-3 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-100 text-xs focus:border-indigo-500 outline-none transition-all placeholder-zinc-700"
+                />
               </div>
 
-              {/* DYNAMIC FIELD BASED ON SELECTION */}
-              <div className="p-4 bg-zinc-950/60 rounded-xl border border-zinc-800/80">
-                {videoSourceType === "gallery" ? (
-                  <div className="space-y-3">
-                    <label className="text-[11px] text-zinc-400 block leading-relaxed font-mono">
-                      Choose from your compiled Mp4 renders or storyboards in the video collection:
-                    </label>
-                    {galleryVideos.length === 0 ? (
-                      <div className="text-xs text-zinc-500 italic py-2">
-                        No videos found in your gallery. Try compiling some script renders or use default fallback loop options below.
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-48 overflow-y-auto pr-2">
-                        {galleryVideos.map((video) => (
-                          <button
-                            type="button"
-                            key={video.id}
-                            onClick={() => setSelectedVideoId(video.id)}
-                            className={`flex items-center gap-3 p-3.5 rounded-xl border text-left transition-all ${
-                              selectedVideoId === video.id
-                                ? "bg-indigo-600/10 border-indigo-500/80 text-white"
-                                : "bg-zinc-950 border-zinc-850 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
-                            }`}
-                          >
-                            <div className="p-2 bg-zinc-900 rounded-lg shrink-0 text-indigo-400 border border-zinc-800">
-                              <Video className="w-4 h-4" />
-                            </div>
-                            <div className="min-w-0">
-                              <p className="text-xs font-bold text-white truncate">{video.video_title}</p>
-                              <p className="text-[10px] text-zinc-500 font-mono mt-1">Aspect: {video.aspectRatio}</p>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                ) : videoSourceType === "drive" ? (
-                  <div className="space-y-3">
-                    <label className="text-[11px] text-zinc-400 block leading-relaxed font-mono">
-                      Insert public/shared Google Drive video URL:
-                    </label>
-                    <div className="relative">
-                      <input
-                        type="url"
-                        placeholder="Insert public/shared Google Drive video URL"
-                        value={driveVideoUrl}
-                        onChange={(e) => setDriveVideoUrl(e.target.value)}
-                        className="w-full px-4 py-3 bg-zinc-950 border border-zinc-850 rounded-xl text-zinc-100 text-xs focus:border-indigo-500 outline-none transition-all placeholder-zinc-600"
-                      />
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    <label className="text-[11px] text-zinc-400 block leading-relaxed font-mono">
-                      Insert any standard YouTube watch link or direct MP4 stream web URL:
-                    </label>
-                    <div className="relative">
-                      <input
-                        type="url"
-                        placeholder="E.g., https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-                        value={customVideoUrl}
-                        onChange={(e) => setCustomVideoUrl(e.target.value)}
-                        className="w-full px-4 py-3 bg-zinc-950 border border-zinc-850 rounded-xl text-zinc-100 text-xs focus:border-indigo-500 outline-none transition-all placeholder-zinc-600"
-                      />
-                    </div>
+              {/* ADVANCED AUTH: YOUTUBE COOKIES FOR BYPASSING BOT CHECKS */}
+              <div className="bg-zinc-900/40 border border-zinc-800/50 rounded-xl p-4 space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setShowCookiesConfig(!showCookiesConfig)}
+                  className="flex items-center justify-between w-full text-left text-xs font-bold text-zinc-300 uppercase tracking-wider hover:text-white transition-all cursor-pointer"
+                >
+                  <span className="flex items-center gap-2">
+                    <Key className="w-3.5 h-3.5 text-indigo-400" />
+                    Advanced: YouTube Auth Cookies (Bypass Bot Challenges)
+                  </span>
+                  <span className="text-xs text-indigo-400 font-mono">
+                    {showCookiesConfig ? "Collapse" : "Expand"}
+                  </span>
+                </button>
+                
+                {showCookiesConfig && (
+                  <div className="space-y-2 pt-1">
+                    <p className="text-[10px] text-zinc-500 leading-normal font-mono">
+                      If stream extraction fails with <code className="text-rose-400">Sign in to confirm you're not a bot</code>, export your browser's YouTube cookies in Netscape format (using browser extensions like "Get cookies.txt LOCALLY" or standard Netscape cookies exporters) and paste them below. This bypasses Cloud Run rate limiting and CAPTCHAs with 100% success.
+                    </p>
+                    <textarea
+                      placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#10;TRUE&#10;/&#10;FALSE&#10;..."
+                      rows={4}
+                      value={youtubeCookies}
+                      onChange={(e) => setYoutubeCookies(e.target.value)}
+                      className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-300 text-[11px] focus:border-indigo-500 outline-none transition-all font-mono placeholder-zinc-800"
+                    />
                   </div>
                 )}
               </div>
 
               {/* RTMP SERVER DESTINATION DETAILS */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
                 
                 {/* RTMP Server URL */}
                 <div className="space-y-2">
@@ -595,6 +477,40 @@ export default function LiveStreamerPage() {
                   </div>
                   <span className="text-[10px] text-zinc-500 font-mono block">
                     Your confidential stream secret. Never share it publicly!
+                  </span>
+                </div>
+
+                {/* Playback Looping Mode */}
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-zinc-300 uppercase tracking-wider block">4. Playback Loop Mode</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setLoopMode("infinite")}
+                      className={`py-3 px-3 rounded-xl border text-[11px] font-bold transition-all ${
+                        loopMode === "infinite"
+                          ? "bg-indigo-600/20 border-indigo-500 text-indigo-400"
+                          : "bg-zinc-950 border-zinc-800 text-zinc-400 hover:border-zinc-700"
+                      }`}
+                    >
+                      Infinity Loop
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setLoopMode("none")}
+                      className={`py-3 px-3 rounded-xl border text-[11px] font-bold transition-all ${
+                        loopMode === "none"
+                          ? "bg-indigo-600/20 border-indigo-500 text-indigo-400"
+                          : "bg-zinc-950 border-zinc-800 text-zinc-400 hover:border-zinc-700"
+                      }`}
+                    >
+                      Play Once
+                    </button>
+                  </div>
+                  <span className="text-[10px] text-zinc-500 font-mono block">
+                    {loopMode === "infinite" 
+                      ? "Continuously loop the video source 24/7." 
+                      : "Stop broadcasting when the video ends."}
                   </span>
                 </div>
 
@@ -698,7 +614,7 @@ export default function LiveStreamerPage() {
                               />
                             );
                           } else {
-                            // Fallback to high-quality stars background
+                            // Fallback to stars background
                             return (
                               <video
                                 src="https://assets.mixkit.co/videos/preview/mixkit-stars-in-space-background-1611-large.mp4"
@@ -741,45 +657,80 @@ export default function LiveStreamerPage() {
 
                   {/* Telemetry and Stats Column */}
                   <div className="lg:col-span-5 flex flex-col justify-between space-y-4 font-mono">
-                    <div className="space-y-3">
-                      <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold">
-                        Pipeline Telemetry
-                      </span>
-                      
-                      <div className="space-y-2 text-[11px]">
-                        <div className="flex justify-between border-b border-zinc-900 pb-1">
-                          <span className="text-zinc-500">RUNTIME_UPTIME:</span>
-                          <span className={streamStatus.isLive ? "text-indigo-400 font-bold" : "text-zinc-600"}>
-                            {streamStatus.isLive ? formatUptime(streamStatus.uptime) : "00:00:00"}
-                          </span>
-                        </div>
-                        
-                        <div className="flex justify-between border-b border-zinc-900 pb-1">
-                          <span className="text-zinc-500">INGEST_BITRATE:</span>
-                          <span className={streamStatus.isLive ? "text-emerald-400 font-bold" : "text-zinc-600"}>
-                            {streamStatus.isLive ? "4500 kbps" : "0 kbps"}
-                          </span>
-                        </div>
+                    <div className="space-y-4">
+                      <div>
+                        <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold block mb-2">
+                          Pipeline Telemetry
+                        </span>
+                        <div className="space-y-2 text-[11px]">
+                          <div className="flex justify-between border-b border-zinc-900 pb-1">
+                            <span className="text-zinc-500">RUNTIME_UPTIME:</span>
+                            <span className={streamStatus.isLive ? "text-indigo-400 font-bold" : "text-zinc-600"}>
+                              {streamStatus.isLive ? formatUptime(streamStatus.uptime) : "00:00:00"}
+                            </span>
+                          </div>
+                          
+                          <div className="flex justify-between border-b border-zinc-900 pb-1">
+                            <span className="text-zinc-500">INGEST_BITRATE:</span>
+                            <span className={streamStatus.isLive ? "text-emerald-400 font-bold" : "text-zinc-600"}>
+                              {streamStatus.isLive ? "4500 kbps" : "0 kbps"}
+                            </span>
+                          </div>
 
-                        <div className="flex justify-between border-b border-zinc-900 pb-1">
-                          <span className="text-zinc-500">NETWORK_LATENCY:</span>
-                          <span className={streamStatus.isLive ? "text-emerald-400 font-bold" : "text-zinc-600"}>
-                            {streamStatus.isLive ? "12ms" : "N/A"}
-                          </span>
-                        </div>
+                          <div className="flex justify-between border-b border-zinc-900 pb-1">
+                            <span className="text-zinc-500">NETWORK_LATENCY:</span>
+                            <span className={streamStatus.isLive ? "text-emerald-400 font-bold" : "text-zinc-600"}>
+                              {streamStatus.isLive ? "12ms" : "N/A"}
+                            </span>
+                          </div>
 
-                        <div className="flex justify-between border-b border-zinc-900 pb-1">
-                          <span className="text-zinc-500">DEST_RTMP:</span>
-                          <span className="text-zinc-400 truncate max-w-[120px]" title={streamStatus.rtmpUrl || rtmpUrl}>
-                            {streamStatus.isLive ? (streamStatus.rtmpUrl || rtmpUrl) : "OFFLINE"}
-                          </span>
-                        </div>
+                          <div className="flex justify-between border-b border-zinc-900 pb-1">
+                            <span className="text-zinc-500">DEST_RTMP:</span>
+                            <span className="text-zinc-400 truncate max-w-[120px]" title={streamStatus.rtmpUrl || rtmpUrl}>
+                              {streamStatus.isLive ? (streamStatus.rtmpUrl || rtmpUrl) : "OFFLINE"}
+                            </span>
+                          </div>
 
-                        <div className="flex justify-between">
-                          <span className="text-zinc-500">LIVE_FEED_SRC:</span>
-                          <span className="text-zinc-400 truncate max-w-[120px]" title={streamStatus.videoSource || "None"}>
-                            {streamStatus.isLive ? (streamStatus.activeVideoTitle || "Active Stream") : "STANDBY"}
-                          </span>
+                          <div className="flex justify-between">
+                            <span className="text-zinc-500">LIVE_FEED_SRC:</span>
+                            <span className="text-zinc-400 truncate max-w-[120px]" title={streamStatus.videoSource || "None"}>
+                              {streamStatus.isLive ? (streamStatus.activeVideoTitle || "Active Stream") : "STANDBY"}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* DIAGNOSTIC ERROR/CRASH DISPLAY */}
+                      {streamStatus.lastCrashReason && (
+                        <div className="p-3 bg-rose-950/20 border border-rose-900/40 rounded-xl space-y-1">
+                          <div className="flex items-center gap-1.5 text-rose-400 font-bold text-[10px] uppercase">
+                            <AlertCircle className="w-3.5 h-3.5" />
+                            Diagnostic Alert
+                          </div>
+                          <p className="text-[10px] text-zinc-300 leading-normal font-mono">
+                            {streamStatus.lastCrashReason}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* FFmpeg ERROR/STDERR OUTPUT LOG PANEL */}
+                      <div className="space-y-1.5">
+                        <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold block">
+                          FFmpeg Output Console
+                        </span>
+                        <div className="bg-zinc-950/90 border border-zinc-900 rounded-xl p-3 h-32 overflow-y-auto text-[10px] text-zinc-400 space-y-1 font-mono">
+                          {streamStatus.errorLog && streamStatus.errorLog.length > 0 ? (
+                            streamStatus.errorLog.map((line, idx) => (
+                              <div key={idx} className="whitespace-pre-wrap select-all selection:bg-indigo-500/30">
+                                <span className="text-zinc-600 select-none mr-2">[{idx + 1}]</span>
+                                <span className={line.toLowerCase().includes("error") || line.toLowerCase().includes("fail") ? "text-rose-400 font-medium" : line.toLowerCase().includes("warn") ? "text-amber-400" : "text-zinc-400"}>
+                                  {line}
+                                </span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="text-zinc-600 italic">No logs available. Start stream to view active terminal output.</div>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -811,19 +762,46 @@ export default function LiveStreamerPage() {
               {/* ACTION COMMAND CONTROLS */}
               <div className="pt-4 border-t border-zinc-900 flex flex-col sm:flex-row items-center gap-3">
                 {streamStatus.isLive ? (
-                  <button
-                    type="button"
-                    onClick={handleStopStream}
-                    disabled={isActionLoading}
-                    className="w-full sm:w-auto flex items-center justify-center gap-2 px-6 py-3.5 bg-rose-600 hover:bg-rose-700 text-xs font-black uppercase text-white rounded-xl transition-all cursor-pointer shadow-lg shadow-rose-600/10 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {isActionLoading ? (
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                    ) : (
+                  showStopConfirm ? (
+                    <div className="flex flex-col sm:flex-row items-center gap-3 w-full sm:w-auto">
+                      <span className="text-xs text-rose-400 font-bold uppercase font-mono tracking-wider animate-pulse shrink-0">
+                        Confirm stopping live feed?
+                      </span>
+                      <div className="flex items-center gap-2 w-full sm:w-auto">
+                        <button
+                          type="button"
+                          onClick={handleStopStream}
+                          disabled={isActionLoading}
+                          className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-xs font-black uppercase text-white rounded-xl transition-all cursor-pointer shadow-lg shadow-rose-600/10 disabled:opacity-50"
+                        >
+                          {isActionLoading ? (
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Square className="w-3.5 h-3.5 fill-current" />
+                          )}
+                          Yes, Stop
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowStopConfirm(false)}
+                          disabled={isActionLoading}
+                          className="flex-1 sm:flex-none px-4 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-xs font-bold uppercase text-zinc-300 rounded-xl transition-all cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setShowStopConfirm(true)}
+                      disabled={isActionLoading}
+                      className="w-full sm:w-auto flex items-center justify-center gap-2 px-6 py-3.5 bg-rose-600 hover:bg-rose-700 text-xs font-black uppercase text-white rounded-xl transition-all cursor-pointer shadow-lg shadow-rose-600/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
                       <Square className="w-4 h-4 fill-current" />
-                    )}
-                    Stop 24/7 Stream
-                  </button>
+                      Stop 24/7 Stream
+                    </button>
+                  )
                 ) : (
                   <button
                     type="submit"
@@ -857,7 +835,8 @@ export default function LiveStreamerPage() {
                 Why Run a 24/7 Live Stream?
               </h3>
               <p className="text-[11px] text-zinc-400 leading-relaxed font-mono">
-                Running 24/7 interactive loops of your short videos/storyboards is one of the fastest algorithmic hacks to build subscribers, authority, and channel search weight. Platform recommend feeds love active high-uptime streams!
+                Running 24/7 interactive loops of your short videos/storyboards is one of the fastest algorithmic hacks to build subscribers, authority, and channel search weight.
+                Platform recommend feeds love active high-uptime streams!
               </p>
             </div>
 
@@ -867,7 +846,8 @@ export default function LiveStreamerPage() {
                 Where do I get my Stream details?
               </h3>
               <p className="text-[11px] text-zinc-400 leading-relaxed font-mono">
-                Log into YouTube Studio → Click "Go Live" top-right. In the Stream Setup tab, copy your "Stream URL" (paste into RTMP Server URL) and "Stream Key" (paste into Stream Key).
+                Log into YouTube Studio → Click "Go Live" top-right.
+                In the Stream Setup tab, copy your "Stream URL" (paste into RTMP Server URL) and "Stream Key" (paste into Stream Key).
               </p>
             </div>
 

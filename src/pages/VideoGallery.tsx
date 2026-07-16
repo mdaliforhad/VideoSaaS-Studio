@@ -144,7 +144,10 @@ export default function VideoGallery() {
     // Check YouTube connection status
     const checkYt = async () => {
       try {
-        const res = await fetch("/api/youtube/status");
+        const token = await user.getIdToken();
+        const res = await fetch("/api/youtube/status", {
+          headers: { "Authorization": `Bearer ${token}` }
+        });
         if (res.ok) {
           const data = await res.json();
           if (active) {
@@ -301,30 +304,17 @@ export default function VideoGallery() {
     }, 120000);
 
     try {
-      // 1. Read file as Base64 to transfer securely to Express server
-      const reader = new FileReader();
-      const base64Promise = new Promise<string>((resolve, reject) => {
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = (e) => reject(e);
-      });
-      reader.readAsDataURL(selectedFile);
-      
-      setUploadProgress(35);
-      const base64Data = await base64Promise;
+      // 1. Prepare FormData for multipart/form-data upload
+      const formData = new FormData();
+      formData.append("video", selectedFile);
+      formData.append("aspectRatio", uploadAspectRatio);
       
       setUploadProgress(50);
 
       // 2. POST payload to local server endpoint with Abort Signal
       const response = await fetch("/api/upload-video", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          video: base64Data,
-          filename: selectedFile.name,
-          aspectRatio: uploadAspectRatio,
-        }),
+        body: formData,
         signal: controller.signal,
       });
 

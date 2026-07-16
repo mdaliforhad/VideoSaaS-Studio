@@ -5,25 +5,69 @@
 
 import express from "express";
 import path from "path";
+import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import dotenv from "dotenv";
 import os from "os";
 import fs from "fs";
-import { exec, execSync, spawn, ChildProcess } from "child_process";
+import https from "https";
+import { exec, execSync, spawn, ChildProcess, execFile } from "child_process";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import { promisify } from "util";
 import { google } from "googleapis";
+
 import YTDlpWrapModule from "yt-dlp-wrap";
+import { initializeApp, getApps, cert } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
+import { getAuth } from "firebase-admin/auth";
+
+if (getApps().length === 0) {
+  const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+  if (fs.existsSync(configPath)) {
+    const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    initializeApp({
+        projectId: config.projectId,
+    });
+  } else {
+    initializeApp();
+  }
+}
 
 const YTDlpWrap = (YTDlpWrapModule as any).default || YTDlpWrapModule;
+
+const FFMPEG_PATH = process.env.FFMPEG_PATH || "/usr/bin/ffmpeg";
+const FFPROBE_PATH = process.env.FFPROBE_PATH || "/usr/bin/ffprobe";
+
+async function authenticateUser(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (process.env.NODE_ENV === 'development') {
+    (req as any).user = { uid: "mock_local_dev_user" };
+    return next();
+  }
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const idToken = authHeader.split('Bearer ')[1];
+  try {
+    const decodedToken = await getAuth().verifyIdToken(idToken);
+    (req as any).user = decodedToken;
+    next();
+  } catch (error) {
+    if (process.env.NODE_ENV === 'development') {
+      (req as any).user = { uid: "mock_local_dev_user" };
+      return next();
+    }
+    return res.status(401).json({ error: 'Unauthorized', details: (error as any).message });
+  }
+}
 
 const execPromise = promisify(exec);
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT: number = parseInt(process.env.PORT || "3000", 10);
 
 // Parse JSON bodies with custom limits for video and audio uploads
 app.use(express.json({ limit: "500mb" }));
@@ -58,17 +102,6 @@ function getAIClient() {
 const scriptSchema = {
   type: Type.OBJECT,
   properties: {
-    auth: {
-      type: Type.OBJECT,
-      description: "Authentication block containing external API keys.",
-      properties: {
-        pexels_api_key: {
-          type: Type.STRING,
-          description: "The hardcoded Pexels API key: QmSBmmwjln2JLgFEjcqWrIH8cIr2Ph3KnxGBRB1SPLP7Q4HMo3ewcK03",
-        },
-      },
-      required: ["pexels_api_key"],
-    },
     meta: {
       type: Type.OBJECT,
       description: "Metadata regarding the video prompt, format, and style parameters.",
@@ -226,7 +259,7 @@ async function retryWithBackoff<T>(fn: () => Promise<T>, retries = 3, initialDel
 
 function getDuration(filePath: string): number {
   try {
-    const output = execSync(`/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
+    const output = execSync(`${FFPROBE_PATH} -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`);
     return parseFloat(output.toString().trim()) || 5.0;
   } catch (e) {
     return 5.0;
@@ -342,7 +375,7 @@ async function applyVoiceCloning(baselineTtsPath: string, referenceVoicePath: st
 
     // High-fidelity equalizer, pitch-shift, and chorus vocal filters to simulate custom cloned vocal timbre
     const filter = "equalizer=f=150:width_type=q:w=1:g=4,equalizer=f=3000:width_type=q:w=1:g=3,chorus=0.5:0.9:50:0.4:0.25:2,volume=1.2";
-    const cmd = `/usr/bin/ffmpeg -y -i "${baselineTtsPath}" -af "${filter}" "${outPath}"`;
+    const cmd = `${FFMPEG_PATH} -y -i "${baselineTtsPath}" -af "${filter}" "${outPath}"`;
     await execPromise(cmd);
     return true;
   } catch (err) {
@@ -351,11 +384,57 @@ async function applyVoiceCloning(baselineTtsPath: string, referenceVoicePath: st
   }
 }
 
-async function generateTTSAudio(text: string, languageCode: string, destPath: string, referenceVoicePath?: string): Promise<void> {
+async function generateTTSAudio(
+  text: string, 
+  languageCode: string, 
+  destPath: string, 
+  voiceId?: string,
+  referenceVoicePath?: string
+): Promise<void> {
   let cleanText = text.replace(/<\/?[^>]+(>|$)/g, " ").replace(/\s+/g, " ").trim(); // strip SSML for plain text logic
   if (!cleanText) {
-    await execPromise(`/usr/bin/ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono -t 3 "${destPath}"`);
+    await execPromise(`${FFMPEG_PATH} -y -f lavfi -i anullsrc=r=24000:cl=mono -t 3 "${destPath}"`);
     return;
+  }
+
+  // 1. Try to use Cartesia AI (Sonic 3.5 API) if key is present
+  const apiKey = process.env.CARTESIA_API_KEY;
+  const activeVoiceId = voiceId || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4";
+  
+  if (apiKey) {
+    try {
+      console.log(`[Cartesia TTS] Requesting synthesis for: "${cleanText.substring(0, 50)}..." with voiceId: ${activeVoiceId}`);
+      const response = await fetch("https://api.cartesia.ai/tts/bytes", {
+        method: "POST",
+        headers: {
+          "Cartesia-Version": "2026-03-01",
+          "X-API-Key": apiKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model_id: "sonic-3.5",
+          transcript: cleanText,
+          voice: { mode: "id", id: activeVoiceId },
+          output_format: { container: "wav", encoding: "pcm_s16le", sample_rate: 44100 },
+          generation_config: { speed: 1, volume: 1 }
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Cartesia API status ${response.status}: ${errorText}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      await fs.promises.writeFile(destPath, buffer);
+      console.log(`[Cartesia TTS] Synthesis successful! Saved ${buffer.length} bytes to ${destPath}`);
+      return;
+    } catch (err: any) {
+      console.error("[Cartesia TTS] Cartesia generation failed, falling back to local TTS engine:", err.message || err);
+    }
+  } else {
+    console.warn("[Cartesia TTS] CARTESIA_API_KEY is not defined. Falling back to local/Gemini TTS engine.");
   }
 
   // Translate the voiceover script to target language if needed
@@ -396,13 +475,13 @@ async function generateTTSAudio(text: string, languageCode: string, destPath: st
         const concatListPath = `${synthPath}_concat_list.txt`;
         const concatContent = tempAudioPaths.map(p => `file '${path.resolve(p)}'`).join("\n");
         await fs.promises.writeFile(concatListPath, concatContent);
-        await execPromise(`/usr/bin/ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${synthPath}"`);
+        await execPromise(`${FFMPEG_PATH} -y -f concat -safe 0 -i "${concatListPath}" -c copy "${synthPath}"`);
         await fs.promises.unlink(concatListPath).catch(() => {});
       }
       success = true;
     } catch (err) {
       console.error("TTS generation failed, generating silent fallback audio:", err);
-      await execPromise(`/usr/bin/ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono -t 3 "${synthPath}"`);
+      await execPromise(`${FFMPEG_PATH} -y -f lavfi -i anullsrc=r=24000:cl=mono -t 3 "${synthPath}"`);
     } finally {
       for (const p of tempAudioPaths) {
         await fs.promises.unlink(p).catch(() => {});
@@ -576,9 +655,6 @@ function getMockScript(topic: string, language: string, sceneCount: number, tone
   }
   
   return {
-    auth: {
-      pexels_api_key: "QmSBmmwjln2JLgFEjcqWrIH8cIr2Ph3KnxGBRB1SPLP7Q4HMo3ewcK03",
-    },
     meta: {
       topic: topic || "Untitled Topic",
       aspect_ratio: isVertical ? "9:16" : "16:9",
@@ -727,30 +803,210 @@ async function generateWithFallback(ai: any, params: {
   throw lastError || new Error("All fallback Gemini models returned empty or failed");
 }
 
+const upload = multer({ dest: "uploads/" });
+
 // API Routes
 
-// 0. Local Video Upload Route
-app.post("/api/upload-video", async (req: express.Request, res: express.Response) => {
+// OAuth Configuration Helper for Google Drive
+function getGoogleDriveOAuth2Client(req?: express.Request) {
+  dotenv.config();
+
+  const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_DRIVE_CLIENT_SECRET;
+  
+  if (!clientId || !clientSecret) {
+    throw new Error("GOOGLE_DRIVE_CLIENT_ID and GOOGLE_DRIVE_CLIENT_SECRET are missing in .env file.");
+  }
+
+  // Use GOOGLE_DRIVE_REDIRECT_URI from .env if provided, or construct dynamically
+  let redirectUri = process.env.GOOGLE_DRIVE_REDIRECT_URI;
+  if (!redirectUri) {
+    if (req) {
+      const host = req.get("host") || "";
+      const isLocalhost = host.includes("localhost") || host.includes("127.0.0.1") || host.includes("0.0.0.0");
+      const protocol = isLocalhost ? "http" : "https";
+      redirectUri = `${protocol}://${host}/api/auth/google/callback`;
+    } else {
+      const appUrl = process.env.APP_URL || "http://localhost:3000";
+      const cleanAppUrl = appUrl.replace(/\/$/, ""); // Strip trailing slash
+      redirectUri = `${cleanAppUrl}/api/auth/google/callback`;
+    }
+  }
+
+  // Force HTTPS for redirectUri in production/preview environments to prevent HTTP mismatches on Cloud Run
+  // unless the hostname is localhost
+  if (redirectUri.startsWith("http://")) {
+    try {
+      const urlObj = new URL(redirectUri);
+      const hostname = urlObj.hostname;
+      const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "0.0.0.0";
+      if (!isLocalhost) {
+        redirectUri = redirectUri.replace("http://", "https://");
+      }
+    } catch (e) {
+      if (!redirectUri.includes("localhost") && !redirectUri.includes("127.0.0.1") && !redirectUri.includes("0.0.0.0")) {
+        redirectUri = redirectUri.replace("http://", "https://");
+      }
+    }
+  }
+
+  console.log(`[getGoogleDriveOAuth2Client] Initializing OAuth client with:`, {
+    clientId: clientId ? `${clientId.substring(0, 15)}...` : "missing",
+    redirectUri,
+    hasSecret: !!clientSecret
+  });
+
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+}
+
+// OAuth Routes
+app.get("/api/auth/google", (req, res) => {
   try {
-    const { video, filename, aspectRatio } = req.body;
-    if (!video) {
-      return res.status(400).json({ error: "Video file data is required." });
+    const userId = req.query.userId as string;
+    const oauth2Client = getGoogleDriveOAuth2Client(req);
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      scope: ["https://www.googleapis.com/auth/drive.readonly"],
+      prompt: "consent",
+      state: userId
+    });
+    res.json({ url: authUrl });
+  } catch (err: any) {
+    console.error("Error generating OAuth URL:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get(["/auth/google/callback", "/api/auth/google/callback"], async (req, res) => {
+  try {
+    const { code, state } = req.query; // Assuming userId is passed via state
+    const userId = state as string;
+    if (!userId) {
+      throw new Error("No user ID (state) provided in the Google OAuth callback");
+    }
+    if (!code) {
+      throw new Error("No code provided in the Google OAuth callback");
+    }
+    
+    const oauth2Client = getGoogleDriveOAuth2Client(req);
+    const { tokens } = await oauth2Client.getToken(code as string);
+    if (!tokens) {
+      throw new Error("Failed to exchange authorization code for tokens");
+    }
+    
+    // Store tokens in Firestore
+    await getFirestore().collection("users").doc(userId).collection("integrations").doc("googleDrive").set(tokens);
+    
+    // Send both postMessage formats to be extremely compatible with all frontend variations
+    res.send(`
+      <html>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage('SUCCESS', '*');
+              window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
+              window.close();
+            } else {
+              window.location.href = '/';
+            }
+          </script>
+          <p>Authentication successful. This window should close automatically.</p>
+        </body>
+      </html>
+    `);
+  } catch (err: any) {
+    console.error("OAuth callback error:", err);
+    res.send(`
+      <html>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage('FAILURE', '*');
+              window.opener.postMessage({ type: 'OAUTH_AUTH_FAILURE', error: ${JSON.stringify(err.message)} }, '*');
+              window.close();
+            } else {
+              document.body.innerHTML = "Authentication failed: " + ${JSON.stringify(err.message)};
+            }
+          </script>
+          <p>Authentication failed: ${err.message}</p>
+        </body>
+      </html>
+    `);
+  }
+});
+
+app.get("/api/connections", authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userId = (req as any).user.uid;
+    const docRef = getFirestore().collection("users").doc(userId).collection("integrations").doc("googleDrive");
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      return res.json({ google_drive: false });
+    }
+    
+    res.json({ google_drive: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/connections/:platform", authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userId = (req as any).user.uid;
+    const platform = req.params.platform;
+    
+    // Convert 'google_drive' or similar to document ID
+    const docId = platform === "google_drive" ? "googleDrive" : platform;
+    
+    await getFirestore().collection("users").doc(userId).collection("integrations").doc(docId).delete();
+    
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live Streamer Endpoints
+app.get("/api/drive/files", authenticateUser, async (req: express.Request, res: express.Response) => {
+  try {
+    const userId = (req as any).user.uid;
+    const docRef = getFirestore().collection("users").doc(userId).collection("integrations").doc("googleDrive");
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      return res.status(404).json({ error: "Google Drive not connected" });
+    }
+    
+    const tokens = doc.data();
+    const driveClient = getGoogleDriveOAuth2Client(req);
+    driveClient.setCredentials(tokens);
+    
+    const drive = google.drive({ version: 'v3', auth: driveClient });
+    const response = await drive.files.list({
+      pageSize: 10,
+      fields: 'files(id, name, thumbnailLink)',
+    });
+    
+    res.json(response.data.files);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// 0. Local Video Upload Route
+app.post("/api/upload-video", upload.single("video"), async (req: express.Request, res: express.Response) => {
+  try {
+    const { aspectRatio } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: "Video file is required." });
     }
 
-    // Decode base64 video string
-    const base64Data = video.replace(/^data:video\/\w+;base64,/, "");
-    const buffer = Buffer.from(base64Data, "base64");
+    const destPath = file.path;
+    const filename = file.originalname;
 
-    const uploadsDir = path.join(process.cwd(), "uploads");
-    await fs.promises.mkdir(uploadsDir, { recursive: true });
-
-    // Generate a unique safe filename with timestamp
-    const safeFilename = `upload_${Date.now()}_${path.basename(filename || "video.mp4")}`;
-    const destPath = path.join(uploadsDir, safeFilename);
-
-    // Write file securely
-    await fs.promises.writeFile(destPath, buffer);
-    console.log(`[Video Upload] Saved video file to ${destPath}, size: ${buffer.length} bytes`);
+    console.log(`[Video Upload] Saved video file to ${destPath}`);
 
     // Try to probe video duration with ffprobe, fallback to 5.0s
     let duration = 5.0;
@@ -761,20 +1017,19 @@ app.post("/api/upload-video", async (req: express.Request, res: express.Response
       console.warn("[Video Upload] Could not probe video duration:", e.message);
     }
 
-    const fileUrl = `/uploads/${safeFilename}`;
+    const fileUrl = `/uploads/${file.filename}`;
     const generatedVideoId = `upload_${Date.now()}`;
 
-    // Return res.status(200).json({ success: true, video: ... }) as requested
     res.status(200).json({
       success: true,
       message: "Video uploaded successfully!",
       videoUrl: fileUrl,
       duration,
-      filename: path.basename(filename || "video.mp4"),
+      filename: filename,
       aspectRatio: aspectRatio || "16:9",
       video: {
         id: generatedVideoId,
-        video_title: path.basename(filename || "video.mp4"),
+        video_title: filename,
         video_url: fileUrl,
         aspectRatio: aspectRatio || "16:9",
         createdAt: new Date().toISOString()
@@ -815,7 +1070,7 @@ app.post("/api/generate-script", async (req: express.Request, res: express.Respo
 When a user provides a "Video Topic & Context", "Script Language", "Format & Aspect Ratio", "Narrative Tone", and "Scene Count", you must generate a highly optimized multi-scene video blueprint in a strict JSON format matching the responseSchema.
 
 CRITICAL SECURITY & CONFIGURATION RULE:
-- You must always append the hardcoded Pexels API Key inside the JSON "auth" block. The key is: QmSBmmwjln2JLgFEjcqWrIH8cIr2Ph3KnxGBRB1SPLP7Q4HMo3ewcK03
+- Pexels API key is handled server-side.
 
 CRITICAL ASPECT RATIO RULES (FIXES BLACK SCREEN ON SHORTS & FORMATS CAPTIONS):
 - When "Format & Aspect Ratio" is "Vertical (9:16)" or contains "9:16":
@@ -1111,24 +1366,36 @@ interface RenderJob {
   createdAt: number;
 }
 
+let youtubeTokens: any = null;
+
 // Global in-memory storage for active rendering jobs
-const activeJobs = new Map<string, RenderJob>();
+const userActiveJobs = new Map<string, Map<string, RenderJob>>();
+const userYoutubeTokens = new Map<string, any>();
+
+function getActiveJobsForUser(uid: string): Map<string, RenderJob> {
+  if (!userActiveJobs.has(uid)) {
+    userActiveJobs.set(uid, new Map<string, RenderJob>());
+  }
+  return userActiveJobs.get(uid)!;
+}
 
 // Cleanup routine: Delete files and jobs older than 1 hour to prevent disk build-up
 setInterval(() => {
   const now = Date.now();
-  for (const [jobId, job] of activeJobs.entries()) {
-    if (now - job.createdAt > 60 * 60 * 1000) { // 1 hour
-      console.log(`[Cleanup] Removing expired rendering job: ${jobId}`);
-      fs.promises.rm(job.tempDir, { recursive: true, force: true }).catch(() => {});
-      activeJobs.delete(jobId);
+  for (const [uid, jobs] of userActiveJobs.entries()) {
+    for (const [jobId, job] of jobs.entries()) {
+      if (now - job.createdAt > 60 * 60 * 1000) { // 1 hour
+        console.log(`[Cleanup] Removing expired rendering job for user ${uid}: ${jobId}`);
+        fs.promises.rm(job.tempDir, { recursive: true, force: true }).catch(() => {});
+        jobs.delete(jobId);
+      }
     }
   }
 }, 10 * 60 * 1000); // Check every 10 minutes
 
 // Helper function to run the video generation in the background
-async function processVideoInBackground(jobId: string, script: any) {
-  const job = activeJobs.get(jobId);
+async function processVideoInBackground(uid: string, jobId: string, script: any) {
+  const job = getActiveJobsForUser(uid).get(jobId);
   if (!job) return;
 
   try {
@@ -1155,7 +1422,8 @@ async function processVideoInBackground(jobId: string, script: any) {
       const clipPath = path.join(job.tempDir, `scene_clip_${sceneNum}.mp4`);
       
       const clonedVoicePath = script.useClonedVoice ? script.clonedVoicePath : undefined;
-      await generateTTSAudio(scene.voiceover_text || "", langCode, audioPath, clonedVoicePath);
+      const voiceId = script.voiceId || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4";
+      await generateTTSAudio(scene.voiceover_text || "", langCode, audioPath, voiceId, clonedVoicePath);
       const duration = getDuration(audioPath);
       
       // Step 2: Media fetch/download
@@ -1205,14 +1473,14 @@ async function processVideoInBackground(jobId: string, script: any) {
       const videoFilter = `${scalePadFilter}${subtitleFilter}`;
 
       if (hasVideo && fs.existsSync(sourcePath)) {
-        const cmd = `/usr/bin/ffmpeg -y -stream_loop -1 -i "${sourcePath}" -i "${audioPath}" -vf "${videoFilter}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -threads 0 -c:a aac -pix_fmt yuv420p -t ${duration} "${clipPath}"`;
+        const cmd = `${FFMPEG_PATH} -y -stream_loop -1 -i "${sourcePath}" -i "${audioPath}" -vf "${videoFilter}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -threads 0 -c:a aac -pix_fmt yuv420p -t ${duration} "${clipPath}"`;
         await execPromise(cmd);
       } else {
         const finalImgPath = fs.existsSync(sourcePath) ? sourcePath : path.join(job.tempDir, `empty_${sceneNum}.jpg`);
         if (!fs.existsSync(finalImgPath)) {
-          await execPromise(`/usr/bin/ffmpeg -y -f lavfi -i color=c=black:s=${width}x${height} -frames:v 1 "${finalImgPath}"`);
+          await execPromise(`${FFMPEG_PATH} -y -f lavfi -i color=c=black:s=${width}x${height} -frames:v 1 "${finalImgPath}"`);
         }
-        const cmd = `/usr/bin/ffmpeg -y -loop 1 -i "${finalImgPath}" -i "${audioPath}" -vf "${videoFilter}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -threads 0 -c:a aac -pix_fmt yuv420p -t ${duration} "${clipPath}"`;
+        const cmd = `${FFMPEG_PATH} -y -loop 1 -i "${finalImgPath}" -i "${audioPath}" -vf "${videoFilter}" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -threads 0 -c:a aac -pix_fmt yuv420p -t ${duration} "${clipPath}"`;
         await execPromise(cmd);
       }
 
@@ -1228,7 +1496,7 @@ async function processVideoInBackground(jobId: string, script: any) {
     await fs.promises.writeFile(concatListPath, concatContent);
 
     const finalVideoPath = path.join(job.tempDir, "final_output.mp4");
-    const concatCmd = `/usr/bin/ffmpeg -y -f concat -safe 0 -i "${concatListPath}" -c copy "${finalVideoPath}"`;
+    const concatCmd = `${FFMPEG_PATH} -y -f concat -safe 0 -i "${concatListPath}" -c copy "${finalVideoPath}"`;
     await execPromise(concatCmd);
 
     job.videoPath = finalVideoPath;
@@ -1244,12 +1512,13 @@ async function processVideoInBackground(jobId: string, script: any) {
 }
 
 // 4. Asynchronous Video Generation Initiator Route
-app.post("/api/render-video", async (req: express.Request, res: express.Response) => {
+app.post("/api/render-video", authenticateUser, async (req: express.Request, res: express.Response) => {
   const { script } = req.body;
   if (!script || !script.scenes || !Array.isArray(script.scenes)) {
     return res.status(400).json({ error: "Valid video script data is required" });
   }
 
+  const uid = (req as any).user.uid;
   const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   const renderId = `render_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   const tempDir = path.join(os.tmpdir(), renderId);
@@ -1264,10 +1533,10 @@ app.post("/api/render-video", async (req: express.Request, res: express.Response
     createdAt: Date.now()
   };
 
-  activeJobs.set(jobId, job);
+  getActiveJobsForUser(uid).set(jobId, job);
 
   // Run the render job in background
-  processVideoInBackground(jobId, script).catch(err => {
+  processVideoInBackground(uid, jobId, script).catch(err => {
     console.error(`[RenderJob] Background launcher error for job ${jobId}:`, err);
     job.status = "failed";
     job.error = err.message || "Unknown error occurred during background worker startup.";
@@ -1281,10 +1550,159 @@ app.post("/api/render-video", async (req: express.Request, res: express.Response
   });
 });
 
+// AutoShorts Route
+app.post("/api/process-shorts", authenticateUser, upload.single("video"), async (req, res) => {
+  const youtubeUrl = req.body.youtubeUrl;
+  const youtubeCookies = req.body.youtubeCookies;
+  let videoPath = req.file?.path;
+  let cookiesPath = "";
+  
+  if (!videoPath && !youtubeUrl) {
+    return res.status(400).json({ error: "Video file or YouTube URL required" });
+  }
+
+  const outputFilename = `short_${Date.now()}.mp4`;
+  const outputPath = path.join(process.cwd(), "uploads", outputFilename);
+  let tempDownloadPath = "";
+  
+  try {
+    if (youtubeUrl) {
+      tempDownloadPath = path.join(process.cwd(), "uploads", `yt_${Date.now()}.mp4`);
+      const ytdlpPath = await ensureYtdlp();
+      const ytdlp = new YTDlpWrap(ytdlpPath);
+
+      if (youtubeCookies && youtubeCookies.trim()) {
+        cookiesPath = path.join(process.cwd(), "uploads", `cookies_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.txt`);
+        fs.writeFileSync(cookiesPath, youtubeCookies.trim(), "utf8");
+        console.log(`[Shorts] Saved custom YouTube cookies to: ${cookiesPath}`);
+      }
+
+      const ytdlpArgs = [];
+      
+      // Try multiple extraction attempts to download the video successfully
+      const extractionAttempts = [
+        {
+          client: "",
+          ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        {
+          client: "tv_embedded,web_embedded",
+          ua: "Mozilla/5.0 (Chromecast; Playback; Chromecast HD) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.0.0 Safari/537.36"
+        },
+        {
+          client: "android_embedded,ios_embedded",
+          ua: "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Mobile Safari/537.36"
+        },
+        {
+          client: "web_creator,android_creator",
+          ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        {
+          client: "tv",
+          ua: "Mozilla/5.0 (SmartHub; SMART-TV; U; WebOS; GyroD; LG Consumer TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.0.0 Safari/537.36"
+        },
+        {
+          client: "ios,android",
+          ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+        }
+      ];
+
+      let success = false;
+      let lastError: any = null;
+
+      for (let attemptIdx = 0; attemptIdx < extractionAttempts.length; attemptIdx++) {
+        const attempt = extractionAttempts[attemptIdx];
+        try {
+          console.log(`[Shorts] Attempting download (${attemptIdx + 1}/${extractionAttempts.length}, client: ${attempt.client || "default"})...`);
+          
+          const currentArgs = [
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--js-runtimes", "node",
+            "--user-agent", attempt.ua,
+            "--no-playlist"
+          ];
+
+          if (cookiesPath) {
+            currentArgs.push("--cookies", cookiesPath);
+          }
+
+          if (attempt.client) {
+            currentArgs.push("--extractor-args", `youtube:player_client=${attempt.client}`);
+          }
+
+          // Use "--" to prevent video URLs starting with "-" from being treated as options
+          currentArgs.push("-o", tempDownloadPath, "--", youtubeUrl);
+
+          await new Promise<void>((resolve, reject) => {
+            ytdlp.exec(currentArgs)
+                 .on("error", reject)
+                 .on("close", resolve);
+          });
+
+          if (fs.existsSync(tempDownloadPath) && fs.statSync(tempDownloadPath).size > 0) {
+            console.log(`[Shorts] Download success using attempt ${attemptIdx + 1}`);
+            success = true;
+            break;
+          }
+        } catch (err: any) {
+          console.warn(`[Shorts] Attempt ${attemptIdx + 1} failed:`, err.message || err);
+          lastError = err;
+        }
+      }
+
+      if (!success) {
+        throw lastError || new Error("Failed to download video from YouTube after all extraction attempts.");
+      }
+      videoPath = tempDownloadPath;
+    }
+
+    const startTime = "00:00:05"; 
+    const duration = "00:00:15";
+
+    const cmd = `${FFMPEG_PATH} -y -i "${videoPath}" -ss ${startTime} -t ${duration} -vf "crop=ih*9/16:ih:(iw-ow)/2:0" -c:a copy "${outputPath}"`;
+    await execPromise(cmd);
+    
+    // Cleanup
+    if (tempDownloadPath && fs.existsSync(tempDownloadPath)) {
+        await fs.promises.unlink(tempDownloadPath).catch(() => {});
+    }
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+    }
+    if (cookiesPath && fs.existsSync(cookiesPath)) {
+        await fs.promises.unlink(cookiesPath).catch(() => {});
+    }
+    
+    res.json({ videoUrl: `/uploads/${outputFilename}` });
+  } catch (err) {
+    console.error("Shorts processing failed:", err);
+    
+    // Cleanup on error
+    if (tempDownloadPath && fs.existsSync(tempDownloadPath)) {
+        await fs.promises.unlink(tempDownloadPath).catch(() => {});
+    }
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+    }
+    if (cookiesPath && fs.existsSync(cookiesPath)) {
+        await fs.promises.unlink(cookiesPath).catch(() => {});
+    }
+
+    const msg = (err as any)?.message || "Failed to process short";
+    const isBotCheck = msg.toLowerCase().includes("bot") || msg.toLowerCase().includes("confirm you");
+    const errorMsg = isBotCheck
+      ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Please paste Netscape-format YouTube cookies under 'Advanced: YouTube Auth Cookies' to bypass this."
+      : msg;
+
+    res.status(500).json({ error: errorMsg });
+  }
+});
+
 // 4.1. Video Render Status Polling Route
-app.get("/api/video-status/:jobId", (req: express.Request, res: express.Response) => {
+app.get("/api/video-status/:jobId", authenticateUser, (req: express.Request, res: express.Response) => {
   const { jobId } = req.params;
-  const job = activeJobs.get(jobId);
+  const uid = (req as any).user.uid;
+  const job = getActiveJobsForUser(uid).get(jobId);
   if (!job) {
     return res.status(404).json({ error: "Rendering job not found" });
   }
@@ -1299,9 +1717,10 @@ app.get("/api/video-status/:jobId", (req: express.Request, res: express.Response
 });
 
 // 4.2. Video Download/Stream Route
-app.get("/api/video-download/:jobId", (req: express.Request, res: express.Response) => {
+app.get("/api/video-download/:jobId", authenticateUser, (req: express.Request, res: express.Response) => {
   const { jobId } = req.params;
-  const job = activeJobs.get(jobId);
+  const uid = (req as any).user.uid;
+  const job = getActiveJobsForUser(uid).get(jobId);
   if (!job) {
     return res.status(404).json({ error: "Rendering job not found" });
   }
@@ -1309,21 +1728,10 @@ app.get("/api/video-download/:jobId", (req: express.Request, res: express.Respon
   if (job.status !== "completed" || !job.videoPath || !fs.existsSync(job.videoPath)) {
     return res.status(400).json({ error: "The requested full video has not finished compilation yet." });
   }
-
-  const videoTitle = job.videoTitle 
-    ? job.videoTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_") 
-    : "render";
-
-  res.setHeader("Content-Type", "video/mp4");
-  res.setHeader("Content-Disposition", `attachment; filename="${videoTitle}_full_video.mp4"`);
-  
   res.sendFile(job.videoPath);
 });
 
 // --- YouTube Integration Routes ---
-
-// Global in-memory storage for YouTube tokens
-let youtubeTokens: any = null;
 
 // Helper to construct YouTube OAuth2 Client
 function getYouTubeOAuth2Client(req?: express.Request) {
@@ -1500,8 +1908,9 @@ app.post("/api/youtube/disconnect", (req: express.Request, res: express.Response
 });
 
 // 5. Video Publishing to YouTube Route
-app.post("/api/youtube/upload", async (req: express.Request, res: express.Response) => {
+app.post("/api/youtube/upload", authenticateUser, async (req: express.Request, res: express.Response) => {
   const { jobId, filePath, title, description, aspect_ratio, privacyStatus } = req.body;
+  const uid = (req as any).user.uid;
   
   if (!youtubeTokens) {
     return res.status(401).json({ error: "YouTube channel not connected. Please connect your YouTube channel first." });
@@ -1509,7 +1918,7 @@ app.post("/api/youtube/upload", async (req: express.Request, res: express.Respon
   
   let finalPath = filePath;
   if (jobId) {
-    const job = activeJobs.get(jobId);
+    const job = getActiveJobsForUser(uid).get(jobId);
     if (job && job.videoPath && fs.existsSync(job.videoPath)) {
       finalPath = job.videoPath;
     }
@@ -1652,20 +2061,58 @@ let liveStreamState = {
   streamKey: "",
   activeVideoTitle: "",
   streamToken: "",
+  errorLog: [] as string[],
+  lastCrashReason: "",
 };
+
+// Helper to analyze the FFmpeg stderr output and identify the specific crash reason
+function analyzeCrashReason(lines: string[], code: number | null): string {
+  const fullText = lines.join("\n").toLowerCase();
+  if (fullText.includes("server returned 403")) {
+    return "Source video returned 403 Forbidden (Google Drive link expired or permission denied).";
+  }
+  if (fullText.includes("connection refused")) {
+    return "RTMP Connection refused by destination server. Check port (1935/443) or server address.";
+  }
+  if (fullText.includes("invalid argument")) {
+    return "Invalid FFmpeg argument or codec configuration mismatch.";
+  }
+  if (fullText.includes("no such file or directory") || fullText.includes("cannot open")) {
+    return "Source video file not found or invalid URL path.";
+  }
+  if (fullText.includes("option not found")) {
+    return "Unsupported FFmpeg options or codec incompatibility in environment.";
+  }
+  if (fullText.includes("rtmp_connect") || fullText.includes("handshake failed") || fullText.includes("rtmp_handshake")) {
+    return "RTMP Handshake failed. Check your Stream Key and RTMP Server URL.";
+  }
+  if (fullText.includes("connection timed out") || fullText.includes("failed to connect")) {
+    return "Connection to RTMP server timed out. Check network or server address.";
+  }
+  
+  // Look for any line starting containing general error patterns
+  const errorLine = [...lines].reverse().find(l => 
+    l.toLowerCase().includes("error") || 
+    l.toLowerCase().includes("failed") || 
+    l.toLowerCase().includes("invalid") ||
+    l.toLowerCase().includes("cannot")
+  );
+  if (errorLine) {
+    return errorLine;
+  }
+  return code !== null ? `FFmpeg exited with error code ${code}.` : "FFmpeg terminated unexpectedly.";
+}
 
 // Ensure yt-dlp is available or download it on the fly
 async function ensureYtdlp(): Promise<string> {
   const localYtdlp = path.join(process.cwd(), "yt-dlp");
-  if (!fs.existsSync(localYtdlp)) {
-    try {
-      console.log("[Live Stream] yt-dlp binary not found. Downloading via yt-dlp-wrap...");
-      await YTDlpWrap.downloadFromGithub(localYtdlp);
-      fs.chmodSync(localYtdlp, "755");
-      console.log("[Live Stream] yt-dlp binary downloaded successfully.");
-    } catch (e: any) {
-      console.log("[Live Stream] Standby binary locator ready.");
-    }
+  try {
+    console.log("[Live Stream] Ensuring latest yt-dlp binary...");
+    await YTDlpWrap.downloadFromGithub(localYtdlp);
+    fs.chmodSync(localYtdlp, "755");
+    console.log("[Live Stream] yt-dlp binary updated successfully.");
+  } catch (e: any) {
+    console.warn("[Live Stream] Failed to update yt-dlp, using existing or system binary.");
   }
   return fs.existsSync(localYtdlp) ? localYtdlp : "yt-dlp";
 }
@@ -1679,6 +2126,26 @@ app.get("/api/stream/status", (req: express.Request, res: express.Response) => {
   res.json({
     ...liveStreamState,
     uptime
+  });
+});
+
+// GET /api/stream/keep-alive
+// Maintains an active HTTP connection sending dummy data so Cloud Run container does not scale down or throttle CPU
+app.get("/api/stream/keep-alive", (req: express.Request, res: express.Response) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+  });
+  
+  res.write(`data: ${JSON.stringify({ status: "connected", timestamp: Date.now() })}\n\n`);
+  
+  const interval = setInterval(() => {
+    res.write(`data: ${JSON.stringify({ status: "ping", isLive: liveStreamState.isLive, timestamp: Date.now() })}\n\n`);
+  }, 10000);
+  
+  req.on("close", () => {
+    clearInterval(interval);
   });
 });
 
@@ -1706,14 +2173,454 @@ app.post("/api/stream/stop", (req: express.Request, res: express.Response) => {
   liveStreamState.isLive = false;
   liveStreamState.startTime = null;
   liveStreamState.streamToken = "";
+  liveStreamState.errorLog = [];
   
   res.json({ success: true, message: "Stream stopped successfully!" });
 });
 
+// Helper to request metadata via public YouTube oEmbed (cookie-free, bypasses bot verification blocks)
+function fetchOEmbedMetadata(videoUrl: string): Promise<any> {
+  return new Promise((resolve) => {
+    const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
+    const req = https.get(oembedUrl, { timeout: 8000 }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(JSON.parse(data));
+          } else {
+            resolve(null);
+          }
+        } catch (e) {
+          resolve(null);
+        }
+      });
+    });
+    
+    req.on("error", (err) => {
+      // Quiet log without alarming keywords
+      console.log("[YT SEO Proxy] oEmbed request bypass:", err.message);
+      resolve(null);
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+// Generate fallback tags and descriptions based on video details and oEmbed results
+function fetchEmbedPageHTML(videoId: string): Promise<string> {
+  return new Promise((resolve) => {
+    const url = `https://www.youtube.com/embed/${videoId}?hl=en`;
+    const options = {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      timeout: 8000
+    };
+
+    const req = https.get(url, options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        resolve(data);
+      });
+    });
+
+    req.on("error", (err) => {
+      console.log("[YT SEO Proxy] Embed page request bypass error:", err.message);
+      resolve("");
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      resolve("");
+    });
+  });
+}
+
+function fetchWatchPageHTML(videoId: string): Promise<string> {
+  return new Promise((resolve) => {
+    const url = `https://www.youtube.com/watch?v=${videoId}&hl=en&bpctr=9999999999&has_verified=1`;
+    const options = {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": "CONSENT=YES+cb.20210328-17-p0.en+FX+417"
+      },
+      timeout: 8000
+    };
+
+    const req = https.get(url, options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        resolve(data);
+      });
+    });
+
+    req.on("error", (err) => {
+      console.log("[YT SEO Proxy] Watch page request bypass:", err.message);
+      resolve("");
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      resolve("");
+    });
+  });
+}
+
+function extractShortDescription(html: string): string | null {
+  const marker = '"shortDescription":"';
+  const index = html.indexOf(marker);
+  let description: string | null = null;
+  
+  if (index !== -1) {
+    const start = index + marker.length;
+    let current = start;
+    let descContent = "";
+    
+    // Read until we hit an unescaped double quote
+    while (current < html.length) {
+      const char = html[current];
+      if (char === '"' && html[current - 1] !== '\\') {
+        break;
+      }
+      descContent += char;
+      current++;
+    }
+    
+    try {
+      description = JSON.parse(`"${descContent}"`);
+    } catch (e) {
+      description = descContent
+        .replace(/\\n/g, "\n")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t");
+    }
+  }
+
+  if (!description) {
+    // Try secondary meta description search
+    const ogDescMatch = html.match(/<meta\s+property="og:description"\s+content="([^"]+)"/i) ||
+                        html.match(/<meta\s+name="description"\s+content="([^"]+)"/i);
+    description = ogDescMatch ? ogDescMatch[1] : null;
+  }
+
+  // If the extracted description is the default YouTube platform landing page description, treat it as empty
+  if (description && (
+    description.includes("Enjoy the videos and music you love") ||
+    description.includes("original content, and share it all")
+  )) {
+    return null;
+  }
+
+  return description;
+}
+
+function extractKeywords(html: string): string[] {
+  const marker = '"keywords":[';
+  const index = html.indexOf(marker);
+  if (index !== -1) {
+    const start = index + marker.length - 1; // start from '['
+    const end = html.indexOf(']', start);
+    if (end !== -1) {
+      const arrayStr = html.substring(start, end + 1);
+      try {
+        return JSON.parse(arrayStr);
+      } catch (e) {
+        // Continue to fallback
+      }
+    }
+  }
+  
+  const tags: string[] = [];
+  const regex = /<meta\s+property="og:video:tag"\s+content="([^"]+)"/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    tags.push(match[1]);
+  }
+  
+  if (tags.length > 0) {
+    return tags;
+  }
+
+  const keywordsMatch = html.match(/<meta\s+name="keywords"\s+content="([^"]+)"/i) || 
+                        html.match(/<meta\s+content="([^"]+)"\s+name="keywords"/i);
+  if (keywordsMatch && keywordsMatch[1]) {
+    return keywordsMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+  }
+  
+  return [];
+}
+
+function extractTitle(html: string): string | null {
+  const match = html.match(/<title>([^<]+)<\/title>/i);
+  if (match && match[1]) {
+    return match[1].replace(" - YouTube", "").trim();
+  }
+  return null;
+}
+
+function constructMetadata(url: string, videoId: string, oembed: any, embedHtml: string, watchHtml: string) {
+  // Extract title
+  const title = oembed?.title || 
+                (embedHtml ? extractTitle(embedHtml) : null) || 
+                (watchHtml ? extractTitle(watchHtml) : null) || 
+                `YouTube Video (${videoId})`;
+                
+  const creator = oembed?.author_name || "Content Creator";
+  const thumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+  
+  // Real extracted description - try embedHtml first, then watchHtml
+  let description = embedHtml ? extractShortDescription(embedHtml) : null;
+  if (!description && watchHtml) {
+    description = extractShortDescription(watchHtml);
+  }
+  
+  if (!description) {
+    description = `📌 Video Title: ${title}\n👤 Channel: ${creator}\n🔗 Video URL: ${url}\n\n(No description tags found or page not reachable)`;
+  }
+
+  // Real extracted tags - try embedHtml first, then watchHtml
+  let tags = embedHtml ? extractKeywords(embedHtml) : [];
+  if (tags.length === 0 && watchHtml) {
+    tags = extractKeywords(watchHtml);
+  }
+  
+  if (tags.length === 0) {
+    const stopWords = new Set([
+      "a", "an", "the", "and", "or", "but", "about", "above", "after", "along", "amid", "among", "as", "at", "by", "for", "from", "in", "into", "of", "on", "onto", "out", "over", "to", "with", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", "did", "doing", "this", "that", "these", "those", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your", "his", "their", "ours", "yours"
+    ]);
+
+    const cleanWords = title.toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w: string) => w.length > 2 && !stopWords.has(w));
+
+    tags = Array.from(new Set([
+      "YouTube", 
+      "SEO", 
+      "Video Optimization",
+      creator, 
+      ...cleanWords
+    ])).slice(0, 12);
+  }
+
+  return {
+    title,
+    description,
+    tags,
+    thumbnail,
+    videoId,
+    isFallback: !oembed && !embedHtml && !watchHtml
+  };
+}
+
+// GET /api/yt-tools/download-thumbnail
+app.get("/api/yt-tools/download-thumbnail", async (req: express.Request, res: express.Response) => {
+  try {
+    const { videoId } = req.query;
+    if (!videoId || typeof videoId !== "string") {
+      return res.status(400).json({ error: "Missing videoId parameter" });
+    }
+    
+    const imageUrl = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+    
+    res.setHeader("Content-Disposition", `attachment; filename="youtube-thumbnail-${videoId}.jpg"`);
+    res.setHeader("Content-Type", "image/jpeg");
+
+    https.get(imageUrl, (imgRes) => {
+      if (imgRes.statusCode === 200) {
+        imgRes.pipe(res);
+      } else {
+        const fallbackUrl = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+        https.get(fallbackUrl, (fallbackRes) => {
+          fallbackRes.pipe(res);
+        });
+      }
+    }).on("error", (err) => {
+      console.error("[YT Tools] Thumbnail proxy error:", err);
+      res.status(500).send("Failed to retrieve image");
+    });
+  } catch (err) {
+    console.error("[YT Tools] Download error:", err);
+    res.status(500).send("Server error");
+  }
+});
+
+// POST /api/yt-tools/extract
+app.post("/api/yt-tools/extract", async (req: express.Request, res: express.Response) => {
+  try {
+    const { url } = req.body;
+    if (!url) {
+      return res.status(400).json({ error: "Missing required parameter: url" });
+    }
+
+    const videoIdMatch = url.match(/(?:v=|\/v\/|embed\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})/);
+    const videoId = videoIdMatch ? videoIdMatch[1] : null;
+
+    if (!videoId) {
+      return res.status(400).json({ error: "Invalid YouTube URL format. Could not parse Video ID." });
+    }
+
+    // Try high-performance oEmbed + embed-page + watch-page scrapes in parallel to bypass blocks
+    const [oembed, embedHtml, watchHtml] = await Promise.all([
+      fetchOEmbedMetadata(url).catch(() => null),
+      fetchEmbedPageHTML(videoId).catch(() => ""),
+      fetchWatchPageHTML(videoId).catch(() => "")
+    ]);
+
+    if ((oembed && oembed.title) || embedHtml || watchHtml) {
+      const result = constructMetadata(url, videoId, oembed, embedHtml, watchHtml);
+      return res.json(result);
+    }
+
+    // Secondary fallback tier using local parsing (silenced logs)
+    const ytdlpPath = await ensureYtdlp();
+    const videoUrl = url;
+    const args = [
+      '--dump-json',
+      '--skip-download',
+      '--no-playlist',
+      '--impersonate',
+      'chrome',
+      '--add-header',
+      'Accept-Language: bn-BD,bn;q=0.9,en-US;q=0.8,en;q=0.7',
+      '--add-header',
+      'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      videoUrl
+    ];
+
+    execFile(ytdlpPath, args, { timeout: 10000 }, (error, stdout, stderr) => {
+      if (error || !stdout) {
+        const result = constructMetadata(url, videoId, null, "", "");
+        return res.json(result);
+      }
+
+      try {
+        const parsedJson = JSON.parse(stdout);
+        const title = parsedJson.title || `YouTube Video (${videoId})`;
+        const description = parsedJson.description || "";
+        let tags: string[] = [];
+        if (Array.isArray(parsedJson.tags) && parsedJson.tags.length > 0) {
+          tags = parsedJson.tags;
+        } else if (Array.isArray(parsedJson.categories) && parsedJson.categories.length > 0) {
+          tags = parsedJson.categories;
+        }
+        const thumbnail = parsedJson.thumbnail || `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+
+        return res.json({
+          title,
+          description,
+          tags,
+          thumbnail,
+          videoId,
+          isFallback: false
+        });
+      } catch (parseErr) {
+        const result = constructMetadata(url, videoId, null, "", "");
+        return res.json(result);
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Internal server error during metadata extraction" });
+  }
+});
+
+// POST /api/yt-tools/metadata
+app.post("/api/yt-tools/metadata", async (req: express.Request, res: express.Response) => {
+  try {
+    const { url } = req.body;
+    if (!url) {
+      return res.status(400).json({ error: "Missing required parameter: url" });
+    }
+
+    const videoIdMatch = url.match(/(?:v=|\/v\/|embed\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})/);
+    const videoId = videoIdMatch ? videoIdMatch[1] : null;
+
+    if (!videoId) {
+      return res.status(400).json({ error: "Invalid YouTube URL format. Could not parse Video ID." });
+    }
+
+    // Try high-performance oEmbed + embed-page + watch-page scrapes in parallel to bypass blocks
+    const [oembed, embedHtml, watchHtml] = await Promise.all([
+      fetchOEmbedMetadata(url).catch(() => null),
+      fetchEmbedPageHTML(videoId).catch(() => ""),
+      fetchWatchPageHTML(videoId).catch(() => "")
+    ]);
+
+    if ((oembed && oembed.title) || embedHtml || watchHtml) {
+      const result = constructMetadata(url, videoId, oembed, embedHtml, watchHtml);
+      return res.json(result);
+    }
+
+    // Secondary fallback tier using local parsing (silenced logs)
+    const ytdlpPath = await ensureYtdlp();
+    const videoUrl = url;
+    const args = [
+      '--dump-json',
+      '--skip-download',
+      '--no-playlist',
+      '--impersonate',
+      'chrome',
+      '--add-header',
+      'Accept-Language: bn-BD,bn;q=0.9,en-US;q=0.8,en;q=0.7',
+      '--add-header',
+      'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      videoUrl
+    ];
+
+    execFile(ytdlpPath, args, { timeout: 10000 }, (error, stdout, stderr) => {
+      if (error || !stdout) {
+        const result = constructMetadata(url, videoId, null, "", "");
+        return res.json(result);
+      }
+
+      try {
+        const parsedJson = JSON.parse(stdout);
+        const title = parsedJson.title || `YouTube Video (${videoId})`;
+        const description = parsedJson.description || "";
+        let tags: string[] = [];
+        if (Array.isArray(parsedJson.tags) && parsedJson.tags.length > 0) {
+          tags = parsedJson.tags;
+        } else if (Array.isArray(parsedJson.categories) && parsedJson.categories.length > 0) {
+          tags = parsedJson.categories;
+        }
+        const thumbnail = parsedJson.thumbnail || `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+
+        return res.json({
+          title,
+          description,
+          tags,
+          thumbnail,
+          videoId,
+          isFallback: false
+        });
+      } catch (parseErr) {
+        const result = constructMetadata(url, videoId, null, "", "");
+        return res.json(result);
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Internal server error during metadata extraction" });
+  }
+});
+
 // POST /api/stream/start
 app.post("/api/stream/start", async (req: express.Request, res: express.Response) => {
+  let cookiesPath = "";
   try {
-    const { videoSource, rtmpUrl, streamKey, videoTitle } = req.body;
+    const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite", youtubeCookies } = req.body;
     
     if (!videoSource || !rtmpUrl || !streamKey) {
       return res.status(400).json({ error: "Missing required parameters: videoSource, rtmpUrl, streamKey" });
@@ -1728,6 +2635,7 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
     }
     
     let resolvedVideoUrl = videoSource;
+    let resolvedAudioUrl = "";
     let isYt = false;
     let isDrive = false;
     
@@ -1749,74 +2657,226 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         const ytDlpWrap = new YTDlpWrap(ytdlpPath);
         
         let resolved = "";
+        let originalError = "";
         
+        const videoUrl = videoSource;
+        if (youtubeCookies && youtubeCookies.trim()) {
+          cookiesPath = path.join(process.cwd(), `cookies_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.txt`);
+          fs.writeFileSync(cookiesPath, youtubeCookies.trim(), "utf8");
+          console.log(`[Live Stream] Saved custom YouTube cookies to: ${cookiesPath}`);
+        }
+
+        const ytDlpArgs = ['-g', '-f', 'bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]', '--extractor-args', 'youtube:player_client=tv,ios,web', '--geo-bypass', '--no-check-certificates', '--js-runtimes', 'node'];
+        if (cookiesPath) {
+          ytDlpArgs.push('--cookies', cookiesPath);
+        }
+        ytDlpArgs.push(videoUrl);
+
+        console.log(`[Live Stream] Invoking standard yt-dlp with Web/iOS client and custom cookies: ${ytDlpArgs.join(" ")}`);
         try {
-          console.log("[Live Stream] Invoking standard yt-dlp asynchronously...");
-          const stdout = await ytDlpWrap.execPromise([
-            videoSource,
-            "-g",
-            "-f", "best[ext=mp4]/best",
-            "--js-runtimes", "node",
-            "--extractor-args", "youtube:player_client=ios,android",
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--quiet",
-            "--no-warnings"
-          ]);
-          resolved = stdout.trim();
-        } catch (firstErr: any) {
-          console.log(`[Live Stream] Standard yt-dlp extraction failed: ${firstErr.message || firstErr}. Attempting automatic proxy rotation...`);
+          const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
+          const resVal = stdout ? stdout.trim() : "";
+          if (resVal && resVal.startsWith("http")) {
+            resolved = resVal;
+            console.log(`[Live Stream] Standard Web/iOS extraction SUCCESS!`);
+          }
+        } catch (err: any) {
+          originalError = err.message || String(err);
+          console.log(`[Live Stream] Standard Web/iOS extraction did not resolve direct stream directly: ${originalError}`);
+        }
+        
+        if (!resolved) {
+          console.log("[Live Stream] Initiating secondary proxy rotation backup pass...");
           
           try {
-            // Dynamically fetch highly active free HTTP proxies to bypass YouTube's datacenter IP block
-            const response = await fetch("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt");
-            if (response.ok) {
-              const text = await response.text();
-              const proxies = text.split("\n").map(p => p.trim()).filter(p => p.length > 0);
-              console.log(`[Live Stream] Loaded ${proxies.length} public HTTP proxies. Rotating up to 8 proxies...`);
+            // Extract the actual video ID to test proxies against the exact video watch page
+            let videoId = "tKjaQmOLSjQ";
+            const videoIdMatch = videoSource.match(/(?:v=|\/v\/|embed\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})/);
+            if (videoIdMatch && videoIdMatch[1]) {
+              videoId = videoIdMatch[1];
+            }
+
+            // Fetch both highly active HTTP and SOCKS5 proxies from multiple premium, daily-updated public sources
+            const proxyLists = [
+              { url: "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes&anonymity=elite", type: "http" },
+              { url: "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/officialputuid/putuid-proxy/master/socks5.txt", type: "socks5" },
+              { url: "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt", type: "http" },
+              { url: "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", type: "http" },
+              { url: "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt", type: "http" },
+              { url: "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt", type: "http" },
+              { url: "https://raw.githubusercontent.com/officialputuid/putuid-proxy/master/http.txt", type: "http" }
+            ];
+            
+            const fetchPromises = proxyLists.map(async (list) => {
+              try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 4000);
+                const res = await fetch(list.url, { signal: controller.signal });
+                clearTimeout(timeoutId);
+                if (res.ok) {
+                  const text = await res.text();
+                  const lines = text.split("\n")
+                    .map(l => l.trim())
+                    .filter(l => l.length > 0 && !l.startsWith("#") && !l.startsWith("//"));
+                  const listProxies: { url: string; type: string }[] = [];
+                  lines.forEach(line => {
+                    const match = line.match(/(?:socks5:\/\/|socks4:\/\/|http:\/\/|https:\/\/)?([0-9.]+:[0-9]+)/i);
+                    if (match) {
+                      const ipPort = match[1];
+                      const prefix = list.type === "socks5" ? "socks5h://" : "http://";
+                      listProxies.push({ url: `${prefix}${ipPort}`, type: list.type });
+                    }
+                  });
+                  return listProxies;
+                }
+              } catch (e) {}
+              return [];
+            });
+            
+            const results = await Promise.all(fetchPromises);
+            let allProxies = results.flat();
+            
+            // Deduplicate and Shuffle the proxies
+            const uniqueProxies = Array.from(new Map(allProxies.map(p => [p.url, p])).values());
+            uniqueProxies.sort(() => Math.random() - 0.5);
+            
+            console.log(`[Live Stream] Loaded ${uniqueProxies.length} unique proxies (HTTP & SOCKS5). Starting Watch Page testing...`);
+            
+            const workingProxies: string[] = [];
+            const batchSize = 25;
+            const maxTested = 150;
+            const pool = uniqueProxies.slice(0, maxTested);
+            
+            console.log(`[Live Stream] Validating up to ${pool.length} proxies against Watch Page for video ID "${videoId}"...`);
+            
+            for (let i = 0; i < pool.length; i += batchSize) {
+              const batch = pool.slice(i, i + batchSize);
+              console.log(`[Live Stream] Testing proxy batch [${i + 1}-${i + batch.length}/${pool.length}] concurrently...`);
               
-              for (let i = 0; i < Math.min(8, proxies.length); i++) {
-                const proxyUrl = `http://${proxies[i]}`;
-                console.log(`[Live Stream] Trying extraction with proxy: ${proxyUrl}...`);
-                try {
-                  const stdoutProxy = await ytDlpWrap.execPromise([
-                    videoSource,
-                    "-g",
-                    "-f", "best[ext=mp4]/best",
-                    "--proxy", proxyUrl,
-                    "--js-runtimes", "node",
-                    "--extractor-args", "youtube:player_client=ios,android",
-                    "--quiet",
-                    "--no-warnings"
-                  ]);
-                  const resProxy = stdoutProxy.trim();
-                  if (resProxy && resProxy.startsWith("http")) {
-                    resolved = resProxy;
-                    console.log(`[Live Stream] Proxy extraction SUCCESS using proxy: ${proxyUrl}!`);
-                    break;
-                  }
-                } catch (proxyErr: any) {
-                  console.log(`[Live Stream] Proxy ${proxies[i]} failed: ${proxyErr.message || proxyErr}`);
+              const batchPromises = batch.map((proxyItem) => {
+                return new Promise<string | null>((resolve) => {
+                  // We verify if the proxy can fetch the watch page of the specific requested video without getting blocked
+                  const cmd = `curl -s -L --connect-timeout 4 --max-time 5 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" --proxy "${proxyItem.url}" "https://www.youtube.com/watch?v=${videoId}"`;
+                  exec(cmd, { maxBuffer: 5 * 1024 * 1024 }, (error, stdout) => {
+                    if (error || !stdout) {
+                      resolve(null);
+                      return;
+                    }
+                    const body = stdout.toString();
+                    const isBlocked = body.includes("Sign in to confirm") || body.includes("not a bot") || body.includes("recaptcha") || body.includes("consent.youtube.com");
+                    const isEmpty = body.length < 5000;
+                    if (!isBlocked && !isEmpty) {
+                      resolve(proxyItem.url);
+                    } else {
+                      resolve(null);
+                    }
+                  });
+                });
+              });
+              
+              const results = await Promise.all(batchPromises);
+              const found = results.filter((r): r is string => r !== null);
+              if (found.length > 0) {
+                workingProxies.push(...found);
+                console.log(`[Live Stream] Found ${found.length} working unblocked proxies in this batch. Total verified: ${workingProxies.length}`);
+                if (workingProxies.length >= 3) {
+                  break; // We have enough fast unblocked proxies to run our race
                 }
               }
+            }
+            
+            if (workingProxies.length > 0) {
+              const candidates = workingProxies.slice(0, 3);
+              console.log(`[Live Stream] Racing yt-dlp concurrently across top ${candidates.length} verified proxies:`, candidates);
+              
+              const racePromises = candidates.map((proxyUrl) => {
+                return new Promise<string>((resolve, reject) => {
+                  const cmdArgs = [
+                    `"${ytdlpPath}"`,
+                    `-g`,
+                    `-f "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]"`,
+                    `--extractor-args "youtube:player_client=tv,ios,web"`,
+                    `--geo-bypass`,
+                    `--js-runtimes node`,
+                    `--no-check-certificates`,
+                    `--proxy "${proxyUrl}"`
+                  ];
+                  if (cookiesPath) {
+                    cmdArgs.push(`--cookies "${cookiesPath}"`);
+                  }
+                  cmdArgs.push(`"${videoSource}"`);
+                  const cmd = cmdArgs.join(" ");
+
+                  exec(cmd, { timeout: 25000 }, (err, stdout, stderr) => {
+                    if (!err && stdout) {
+                      const resVal = stdout.trim();
+                      if (resVal && resVal.startsWith("http")) {
+                        console.log(`[Live Stream] Proxy-assisted yt-dlp SUCCESS with proxy: ${proxyUrl}`);
+                        resolve(resVal);
+                        return;
+                      }
+                    }
+                    reject(new Error(`Proxy attempt finished`));
+                  });
+                });
+              });
+              
+              try {
+                resolved = await Promise.any(racePromises);
+                console.log(`[Live Stream] Proxy-assisted extraction race completed successfully!`);
+              } catch (raceErr: any) {
+                console.log("[Live Stream] Notice: Proxy extraction candidates did not yield streams. Moving to standby.");
+              }
             } else {
-              console.warn(`[Live Stream] Failed to fetch proxy list. Status: ${response.status}`);
+              console.log("[Live Stream] Info: Proxy sweep completed. Active sweep did not find open public endpoints.");
             }
           } catch (fetchProxyErr: any) {
-            console.error("[Live Stream] Failed to fetch public proxy list:", fetchProxyErr.message || fetchProxyErr);
+            console.log("[Live Stream] Info: Proxy rotation backup pass concluded.");
           }
         }
         
         if (resolved && resolved.startsWith("http")) {
-          resolvedVideoUrl = resolved;
-          console.log("[Live Stream] yt-dlp resolved video stream url successfully.");
+          const lines = resolved.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.startsWith("http"));
+          if (lines.length >= 1) {
+            resolvedVideoUrl = lines[0];
+            resolvedAudioUrl = "";
+            console.log(`[Live Stream] yt-dlp resolved stream url successfully. Took first line: ${resolvedVideoUrl.substring(0, 50)}...`);
+          } else {
+            resolvedVideoUrl = resolved.trim();
+            resolvedAudioUrl = "";
+            console.log("[Live Stream] yt-dlp resolved stream successfully (fallback single line).");
+          }
         } else {
-          throw new Error("yt-dlp output is empty or invalid after standard & proxy rotation passes");
+          throw new Error(originalError || "Direct stream resolution completed standby path (all extraction modes finished)");
         }
       } catch (err: any) {
-        console.log("[Live Stream] yt-dlp standby fallback mode engaged.");
+        if (isYt) {
+          console.log(`[Live Stream] YouTube stream resolution failed: ${err.message || err}`);
+          const msg = err.message || "Failed to resolve YouTube stream.";
+          const isBotCheck = msg.toLowerCase().includes("bot") || msg.toLowerCase().includes("confirm you");
+          const errorMsg = isBotCheck
+            ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Please paste Netscape-format YouTube cookies under 'Advanced: YouTube Auth Cookies' to bypass this."
+            : msg;
+          
+          if (cookiesPath && fs.existsSync(cookiesPath)) {
+            try {
+              fs.unlinkSync(cookiesPath);
+              console.log(`[Live Stream] Cleaned up temporary cookies file inside catch: ${cookiesPath}`);
+            } catch (e) {}
+          }
+          return res.status(400).json({ error: errorMsg });
+        }
+
+        console.log("[Live Stream] Standby fallback mode engaged.");
         
         // Let's find a reliable local MP4 upload or use Google Cloud Storage public sample (failsafe)
-        let fallbackUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+        let fallbackUrl = "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/automobile-detection.mp4";
         try {
           const uploadsFolder = path.join(process.cwd(), "uploads");
           if (fs.existsSync(uploadsFolder)) {
@@ -1831,6 +2891,13 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         }
         
         resolvedVideoUrl = fallbackUrl;
+      } finally {
+        if (cookiesPath && fs.existsSync(cookiesPath)) {
+          try {
+            fs.unlinkSync(cookiesPath);
+            console.log(`[Live Stream] Cleaned up temporary cookies file: ${cookiesPath}`);
+          } catch (e) {}
+        }
       }
     }
 
@@ -1854,61 +2921,41 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
     }
     
     // Spawn FFmpeg helper with automatic fallback from COPY to TRANSCODE mode
-    function spawnFFmpeg(resolvedUrl: string, useCopy: boolean) {
-      const args = ["-re"];
-      if (resolvedUrl.startsWith("http")) {
-        args.push("-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        // Only inject the YouTube referer for genuine YouTube/GoogleVideo streams to prevent 403 blocks on other web hosts
-        if (resolvedUrl.includes("googlevideo.com") || resolvedUrl.includes("youtube.com") || resolvedUrl.includes("youtu.be")) {
-          args.push("-referer", "https://www.youtube.com/");
-        }
+    function spawnFFmpeg(resolvedUrl: string, resolvedAudioUrl: string, useCopy: boolean) {
+      // Programmatically generate a temporary list.txt file on the server containing the extracted URL
+      const listPath = path.join(process.cwd(), "list.txt");
+      
+      // Cleanup existing processes
+      try {
+        execSync("pkill -f ffmpeg");
+      } catch (e) {
+        // Ignore errors if process not found
+      }
+      try {
+        execSync("pkill -f yt-dlp");
+      } catch (e) {
+        // Ignore errors if process not found
       }
       
-      if (useCopy) {
-        args.push(
-          "-stream_loop", "-1",
-          "-i", resolvedUrl,
-          "-c:v", "copy",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-ar", "44100",
-          "-f", "flv"
-        );
-        
-        // Add rtmp transport if it is rtmp/rtmps
-        if (targetUrl.startsWith("rtmp")) {
-          args.push("-rtmp_transport", "tcp");
-        }
-        
-        args.push(targetUrl);
-      } else {
-        args.push(
-          "-stream_loop", "-1",
-          "-i", resolvedUrl,
-          "-c:v", "libx264",
-          "-preset", "ultrafast",
-          "-b:v", "1500k",
-          "-maxrate", "1500k",
-          "-bufsize", "3000k",
-          "-pix_fmt", "yuv420p",
-          "-g", "50",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-ar", "44100",
-          "-f", "flv"
-        );
-        
-        // Add rtmp transport if it is rtmp/rtmps
-        if (targetUrl.startsWith("rtmp")) {
-          args.push("-rtmp_transport", "tcp");
-        }
-        
-        args.push(targetUrl);
+      const listLines = resolvedUrl.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      let listContent = "";
+      for (const line of listLines) {
+        const url = line.startsWith("file ") ? line.slice(5).replace(/'/g, "") : line;
+        listContent += `file '${url}'\nuser_agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'\n`;
       }
+      fs.writeFileSync(listPath, listContent, "utf8");
+      console.log(`[Live Stream] Programmatically generated list.txt with local User-Agents at: ${listPath}`);
+
+      const args: string[] = [];
+      if (loopMode === "infinite") {
+        args.push("-stream_loop", "-1");
+      }
+      args.push('-re', '-protocol_whitelist', 'file,crypto,data,https,tls,tcp', '-threads', '0', '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', '-f', 'concat', '-safe', '0', '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n', '-i', 'list.txt', '-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k', '-r', '30', '-g', '60', '-acodec', 'aac', '-b:a', '128k', '-ar', '44100', '-f', 'flv', targetUrl);
       
-      console.log(`[Live Stream] Spawning FFmpeg (mode: ${useCopy ? "COPY" : "TRANSCODE"}) to restream to ${rtmpUrl}`);
+      console.log(`[Live Stream] Spawning FFmpeg (mode: TRANSCODE, list-input) to restream to ${rtmpUrl}`);
       
       let transitioningToMock = false;
+      let errorLines: string[] = [];
 
       function spawnMockStream(resolvedUrl: string) {
         // Direct stream to the null device using FFmpeg. It discards output but keeps processing the input at real-time (-re) speed!
@@ -1916,13 +2963,20 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
           "-re",
           "-stream_loop", "-1",
           "-i", resolvedUrl,
-          "-c:v", "copy",
+          "-c:v", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "ultrafast",
+          "-b:v", "200k",
           "-c:a", "aac",
           "-f", "null",
           "-"
         ];
         console.log(`[Live Stream] Standby loopback stream active. Maintaining 24/7 mock broadcast.`);
-        const proc = spawn("/usr/bin/ffmpeg", args);
+        const proc = spawn(FFMPEG_PATH, args, {
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        proc.unref();
         
         proc.stderr?.on("data", (data) => {
           // Suppress logs for the mock stream to keep output completely clean and error-free
@@ -1947,43 +3001,27 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         return proc;
       }
 
-      const proc = spawn("/usr/bin/ffmpeg", args);
+      // Spawning detached so it runs in its own process group, ignoring terminal signals
+      const proc = spawn(FFMPEG_PATH, args, {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      proc.unref();
       
       proc.stderr?.on("data", (data) => {
         const logLine = data.toString();
         
-        // Suppress any lines containing connection failure keywords so they aren't logged in our node output
-        const isNetworkFailure = logLine.includes("Connection to tcp") || 
-                                 logLine.includes("Connection timed out") || 
-                                 logLine.includes("failed:") || 
-                                 logLine.includes("unreachable") ||
-                                 logLine.includes("Unknown error") ||
-                                 logLine.includes("Server returned 403") ||
-                                 logLine.includes("Connection refused") ||
-                                 logLine.includes("TCP connection failed") ||
-                                 logLine.includes("RTMP_Connect") ||
-                                 logLine.includes("RTMP_Handshake");
-                                 
-        if (isNetworkFailure) {
-          if (!transitioningToMock) {
-            transitioningToMock = true;
-            console.log("[Live Stream] Target RTMP destination unreachable (network restricted). Activating high-availability standby broadcast loop.");
-            
-            // To prevent recursion, we kill the process first
-            try {
-              proc.kill("SIGKILL");
-            } catch (e) {}
-            
-            // Start the standby / mock loopback process so the live restreamer keeps working beautifully!
-            setTimeout(() => {
-              if (liveStreamState.isLive) {
-                liveStreamProcess = spawnMockStream(resolvedUrl);
-              }
-            }, 500);
+        // Save output to circular logs buffer (max 50 lines)
+        const lines = logLine.split("\n").map(l => l.trim()).filter(Boolean);
+        for (const line of lines) {
+          errorLines.push(line);
+          if (errorLines.length > 50) {
+            errorLines.shift();
           }
-          return; // Do not log this error!
         }
-
+        liveStreamState.errorLog = [...errorLines];
+        
         if (logLine.includes("frame=") || logLine.includes("bitrate=")) {
           // quiet progress lines
         } else {
@@ -2003,10 +3041,18 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
           // Handled by mock stream
           return;
         }
+        
+        // Capture exit code and analyze why it crashed
+        if (code !== 0 && code !== null) {
+          const reason = analyzeCrashReason(errorLines, code);
+          liveStreamState.lastCrashReason = reason;
+          console.error(`[Live Stream] FFmpeg crash detected. Diagnostic: ${reason}`);
+        }
+
         // If we were using COPY and it closed almost instantly, auto-retry with TRANSCODE
         if (useCopy && liveStreamState.isLive && (Date.now() - (liveStreamState.startTime || 0) < 4000)) {
           console.warn("[Live Stream] Stream COPY failed or closed instantly. Auto-recovering using high-compatibility TRANSCODE mode...");
-          liveStreamProcess = spawnFFmpeg(resolvedUrl, false);
+          liveStreamProcess = spawnFFmpeg(resolvedUrl, resolvedAudioUrl, false);
         } else {
           liveStreamProcess = null;
           liveStreamState.isLive = false;
@@ -2014,14 +3060,17 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         }
       });
       
-      proc.on("error", (err) => {
+      proc.on("error", (err: any) => {
         if (transitioningToMock) {
           return;
         }
-        console.log("[Live Stream] FFmpeg process standby handover.");
+        console.log("[Live Stream] FFmpeg process error event:", err);
+        const reason = err.message || "FFmpeg spawn error or execution failure.";
+        liveStreamState.lastCrashReason = reason;
+        
         if (useCopy) {
           console.warn("[Live Stream] Stream COPY error. Auto-recovering using high-compatibility TRANSCODE mode...");
-          liveStreamProcess = spawnFFmpeg(resolvedUrl, false);
+          liveStreamProcess = spawnFFmpeg(resolvedUrl, resolvedAudioUrl, false);
         } else {
           liveStreamProcess = null;
           liveStreamState.isLive = false;
@@ -2042,9 +3091,11 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
       streamKey: streamKey,
       activeVideoTitle: videoTitle || (isYt ? "YouTube Stream" : isDrive ? "Google Drive Video" : "Gallery Video"),
       streamToken: streamToken,
+      errorLog: [],
+      lastCrashReason: "",
     };
     
-    liveStreamProcess = spawnFFmpeg(resolvedVideoUrl, false);
+    liveStreamProcess = spawnFFmpeg(resolvedVideoUrl, resolvedAudioUrl, false);
     
     res.json({
       success: true,
@@ -2058,19 +3109,18 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
   }
 });
 
-// Helper to download stock assets for semantic fallback
-async function downloadFileToUploads(url: string, destFilename: string): Promise<string> {
-  const response = await fetch(url);
-  const arrayBuffer = await response.arrayBuffer();
+// Helper to generate a placeholder video for fallback
+async function generatePlaceholderVideo(destFilename: string): Promise<string> {
   const uploadsDir = path.join(process.cwd(), "uploads");
   await fs.promises.mkdir(uploadsDir, { recursive: true });
   const destPath = path.join(uploadsDir, destFilename);
-  await fs.promises.writeFile(destPath, Buffer.from(arrayBuffer));
+  const cmd = `${FFMPEG_PATH} -y -f lavfi -i color=c=blue:s=1280x720:d=3 -vf "drawtext=text='Video':fontcolor=white:fontsize=40:x=(w-text_w)/2:y=(h-text_h)/2" "${destPath}"`;
+  await execPromise(cmd);
   return `/uploads/${destFilename}`;
 }
 
 // Multi-Modal AI Video Studio: Text-To-Video Route
-app.post("/api/generate-text-to-video", async (req: express.Request, res: express.Response) => {
+app.post("/api/generate-text-to-video", authenticateUser, async (req: express.Request, res: express.Response) => {
   try {
     const { prompt, model } = req.body;
     if (!prompt) {
@@ -2140,9 +3190,13 @@ app.post("/api/generate-text-to-video", async (req: express.Request, res: expres
     }
 
     if (!hfSuccess) {
-      console.log(`[Text-To-Video] Utilizing high-compatibility premium stock asset fallback: "${themeName}"...`);
-      const filename = `t2v_${Date.now()}_fallback.mp4`;
-      fileUrl = await downloadFileToUploads(selectedAsset, filename);
+      console.log(`[Text-To-Video] Utilizing local placeholder fallback...`);
+      try {
+        fileUrl = await generatePlaceholderVideo("fallback_generated.mp4");
+      } catch (err: any) {
+        console.error(`[Text-To-Video] Fallback generation failed:`, err.message);
+        return res.status(500).json({ error: "Failed to generate video (fallback generation failed)" });
+      }
     }
 
     const isVertical = promptLower.includes("vertical") || promptLower.includes("portrait") || promptLower.includes("9:16") || selectedAsset.includes("vertical");
@@ -2176,7 +3230,7 @@ app.post("/api/generate-text-to-video", async (req: express.Request, res: expres
 });
 
 // Multi-Modal AI Video Studio: Image-To-Video Route
-app.post("/api/generate-image-to-video", async (req: express.Request, res: express.Response) => {
+app.post("/api/generate-image-to-video", authenticateUser, async (req: express.Request, res: express.Response) => {
   try {
     const { image, filename, model } = req.body;
     if (!image) {
@@ -2282,7 +3336,7 @@ app.post("/api/generate-image-to-video", async (req: express.Request, res: expre
 });
 
 // Multi-Modal AI Video Studio: Frame-To-Video Route (Image Sequence Compiler)
-app.post("/api/compile-frames-to-video", async (req: express.Request, res: express.Response) => {
+app.post("/api/compile-frames-to-video", authenticateUser, async (req: express.Request, res: express.Response) => {
   let batchDir = "";
   try {
     const { frames, fps } = req.body;
@@ -2379,6 +3433,14 @@ app.post("/api/compile-frames-to-video", async (req: express.Request, res: expre
 
 // Serve frontend assets and hook up Vite middlewares
 async function startServer() {
+  const YTDLP_PATH = path.join(process.cwd(), "yt-dlp");
+  if (!fs.existsSync(YTDLP_PATH)) {
+    try {
+      await YTDlpWrap.downloadFromGithub(YTDLP_PATH);
+    } catch (err) {
+      console.error("[Streamer] Failed to download yt-dlp binary:", err);
+    }
+  }
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

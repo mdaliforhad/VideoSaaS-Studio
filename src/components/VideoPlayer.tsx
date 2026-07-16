@@ -241,7 +241,10 @@ export default function VideoPlayer({
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ script }),
+        body: JSON.stringify({ 
+          script, 
+          voiceId: script.voiceId || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4" 
+        }),
       });
 
       if (!response.ok) {

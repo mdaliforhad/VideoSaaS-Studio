@@ -1,6 +1,6 @@
 import React from "react";
 import { NavLink, Link } from "react-router-dom";
-import { Video, Film, CreditCard, Sparkles, LogOut, ExternalLink, User, Radio } from "lucide-react";
+import { Video, Film, CreditCard, Sparkles, LogOut, ExternalLink, User, Radio, Scissors, Plug, Search } from "lucide-react";
 import { useAuth } from "./AuthProvider";
 
 export default function SaaSSidebar() {
@@ -80,6 +80,48 @@ export default function SaaSSidebar() {
             >
               <Radio className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
               <span>24/7 Live Streamer</span>
+            </NavLink>
+
+            <NavLink
+              to="/youtube-tools"
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 group cursor-pointer ${
+                  isActive
+                    ? "bg-indigo-600/10 text-indigo-400 border-l-4 border-indigo-500 shadow-[inset_4px_0_12px_rgba(99,102,241,0.05)]"
+                    : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60"
+                }`
+              }
+            >
+              <Search className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
+              <span>YouTube SEO Tools</span>
+            </NavLink>
+
+            <NavLink
+              to="/shorts"
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 group cursor-pointer ${
+                  isActive
+                    ? "bg-indigo-600/10 text-indigo-400 border-l-4 border-indigo-500 shadow-[inset_4px_0_12px_rgba(99,102,241,0.05)]"
+                    : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60"
+                }`
+              }
+            >
+              <Scissors className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
+              <span>AutoShorts AI</span>
+            </NavLink>
+            
+            <NavLink
+              to="/connections"
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-bold transition-all duration-200 group cursor-pointer ${
+                  isActive
+                    ? "bg-indigo-600/10 text-indigo-400 border-l-4 border-indigo-500 shadow-[inset_4px_0_12px_rgba(99,102,241,0.05)]"
+                    : "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900/60"
+                }`
+              }
+            >
+              <Plug className="h-4 w-4 text-zinc-400 group-hover:text-indigo-400 shrink-0" />
+              <span>Connections</span>
             </NavLink>
 
             <NavLink

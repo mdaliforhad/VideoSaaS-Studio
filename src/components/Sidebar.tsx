@@ -413,6 +413,22 @@ export default function Sidebar({
               />
             </div>
 
+            {/* Cartesia Voice Selection */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-slate-300 flex items-center gap-1.5">
+                <Mic className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                Cartesia Narration Voice
+              </label>
+              <select
+                value={settings.voiceId || "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"}
+                onChange={(e) => setSettings({ ...settings, voiceId: e.target.value })}
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-slate-200 text-xs focus:border-indigo-500 outline-none transition-all cursor-pointer"
+              >
+                <option value="db6b0ed5-d5d3-463d-ae85-518a07d3c2b4">Sonic Male (db6b0ed5-d5d3-463d-ae85-518a07d3c2b4)</option>
+                <option value="a0e99861-435f-4054-9fa7-f834ec33e707">Sonic Female (a0e99861-435f-4054-9fa7-f834ec33e707)</option>
+              </select>
+            </div>
+
             {/* Language */}
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-slate-300 flex items-center gap-1.5">

@@ -32,6 +32,7 @@ export default function StudioDashboard() {
     sceneCount: 5,
     tone: "educational",
     pexelsApiKey: "",
+    voiceId: "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4",
   });
 
   const [script, setScript] = useState<VideoScript | null>(null);
@@ -91,22 +92,27 @@ export default function StudioDashboard() {
     };
   }, [user]);
 
-  // Synchronize cloned voice options reactively from settings to active script
+  // Synchronize cloned voice and Cartesia voice selection reactively from settings to active script
   useEffect(() => {
     if (script) {
       setScript((prev) => {
         if (!prev) return null;
-        if (prev.useClonedVoice === settings.useClonedVoice && prev.clonedVoicePath === settings.clonedVoicePath) {
+        if (
+          prev.useClonedVoice === settings.useClonedVoice && 
+          prev.clonedVoicePath === settings.clonedVoicePath &&
+          prev.voiceId === settings.voiceId
+        ) {
           return prev;
         }
         return {
           ...prev,
           useClonedVoice: settings.useClonedVoice,
           clonedVoicePath: settings.clonedVoicePath,
+          voiceId: settings.voiceId,
         };
       });
     }
-  }, [settings.useClonedVoice, settings.clonedVoicePath]);
+  }, [settings.useClonedVoice, settings.clonedVoicePath, settings.voiceId]);
 
   // Save scripts collection to LocalStorage
   const saveScriptsToStorage = (updated: VideoScript[]) => {
@@ -260,6 +266,7 @@ export default function StudioDashboard() {
         id: crypto.randomUUID(),
         aspectRatio: settings.aspectRatio,
         tone: settings.tone,
+        voiceId: settings.voiceId,
         createdAt: new Date().toISOString(),
       };
 

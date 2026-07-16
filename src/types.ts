@@ -23,6 +23,7 @@ export interface VideoScript {
   isFallback?: boolean;
   useClonedVoice?: boolean;
   clonedVoicePath?: string;
+  voiceId?: string;
 }
 
 export interface WorkspaceSettings {
@@ -34,4 +35,11 @@ export interface WorkspaceSettings {
   pexelsApiKey: string;
   useClonedVoice?: boolean;
   clonedVoicePath?: string;
+  voiceId?: string;
+}
+
+export interface PlatformConnection {
+  platform: "google_drive" | "youtube" | "dropbox" | "onedrive" | "tiktok";
+  connected: boolean;
+  lastUpdated: string;
 }
