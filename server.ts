@@ -2843,10 +2843,14 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         
         if (resolved && resolved.startsWith("http")) {
           const lines = resolved.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.startsWith("http"));
-          if (lines.length >= 1) {
+          if (lines.length >= 2) {
+            resolvedVideoUrl = lines[0];
+            resolvedAudioUrl = lines[1];
+            console.log(`[Live Stream] yt-dlp resolved separate video and audio stream urls successfully.\nVideo: ${resolvedVideoUrl.substring(0, 50)}...\nAudio: ${resolvedAudioUrl.substring(0, 50)}...`);
+          } else if (lines.length === 1) {
             resolvedVideoUrl = lines[0];
             resolvedAudioUrl = "";
-            console.log(`[Live Stream] yt-dlp resolved stream url successfully. Took first line: ${resolvedVideoUrl.substring(0, 50)}...`);
+            console.log(`[Live Stream] yt-dlp resolved single stream url successfully: ${resolvedVideoUrl.substring(0, 50)}...`);
           } else {
             resolvedVideoUrl = resolved.trim();
             resolvedAudioUrl = "";
@@ -2922,9 +2926,6 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
     
     // Spawn FFmpeg helper with automatic fallback from COPY to TRANSCODE mode
     function spawnFFmpeg(resolvedUrl: string, resolvedAudioUrl: string, useCopy: boolean) {
-      // Programmatically generate a temporary list.txt file on the server containing the extracted URL
-      const listPath = path.join(process.cwd(), "list.txt");
-      
       // Cleanup existing processes
       try {
         execSync("pkill -f ffmpeg");
@@ -2937,22 +2938,65 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         // Ignore errors if process not found
       }
       
-      const listLines = resolvedUrl.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-      let listContent = "";
-      for (const line of listLines) {
-        const url = line.startsWith("file ") ? line.slice(5).replace(/'/g, "") : line;
-        listContent += `file '${url}'\nuser_agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'\n`;
-      }
-      fs.writeFileSync(listPath, listContent, "utf8");
-      console.log(`[Live Stream] Programmatically generated list.txt with local User-Agents at: ${listPath}`);
-
       const args: string[] = [];
+      
+      // Global / Input configuration: stream looping
       if (loopMode === "infinite") {
         args.push("-stream_loop", "-1");
       }
-      args.push('-re', '-protocol_whitelist', 'file,crypto,data,https,tls,tcp', '-threads', '0', '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', '-f', 'concat', '-safe', '0', '-headers', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n', '-i', 'list.txt', '-vcodec', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-b:v', '2500k', '-maxrate', '2500k', '-bufsize', '5000k', '-r', '30', '-g', '60', '-acodec', 'aac', '-b:a', '128k', '-ar', '44100', '-f', 'flv', targetUrl);
       
-      console.log(`[Live Stream] Spawning FFmpeg (mode: TRANSCODE, list-input) to restream to ${rtmpUrl}`);
+      // First input: Video (or combined stream)
+      args.push(
+        "-re",
+        "-protocol_whitelist", "file,crypto,data,https,tls,tcp",
+        "-threads", "0",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n",
+        "-i", resolvedUrl
+      );
+
+      // Second input: Audio (if present)
+      const hasAudioInput = resolvedAudioUrl && resolvedAudioUrl.trim();
+      if (hasAudioInput) {
+        if (loopMode === "infinite") {
+          args.push("-stream_loop", "-1");
+        }
+        args.push(
+          "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n",
+          "-i", resolvedAudioUrl
+        );
+      }
+
+      // Map streams
+      if (hasAudioInput) {
+        args.push("-map", "0:v", "-map", "1:a");
+      } else {
+        args.push("-map", "0:v?", "-map", "0:a?");
+      }
+
+      // Configure video and audio codecs
+      if (useCopy) {
+        args.push("-vcodec", "copy", "-acodec", "copy");
+      } else {
+        args.push(
+          "-vcodec", "libx264",
+          "-pix_fmt", "yuv420p",
+          "-preset", "ultrafast",
+          "-b:v", "2500k",
+          "-maxrate", "2500k",
+          "-bufsize", "5000k",
+          "-r", "30",
+          "-g", "60",
+          "-acodec", "aac",
+          "-b:a", "128k",
+          "-ar", "44100"
+        );
+      }
+
+      args.push("-f", "flv", targetUrl);
+      
+      console.log(`[Live Stream] Spawning FFmpeg (mode: ${useCopy ? 'COPY' : 'TRANSCODE'}, direct-input) to restream to ${rtmpUrl}`);
       
       let transitioningToMock = false;
       let errorLines: string[] = [];
