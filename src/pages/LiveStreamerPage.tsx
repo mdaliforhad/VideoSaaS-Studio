@@ -49,8 +49,6 @@ export default function LiveStreamerPage() {
   const [streamKey, setStreamKey] = useState(() => localStorage.getItem("stream_streamKey") || "");
   const [videoTitle, setVideoTitle] = useState("");
   const [loopMode, setLoopMode] = useState<"infinite" | "once">("infinite");
-  const [youtubeCookies, setYoutubeCookies] = useState("");
-  const [showCookiesConfig, setShowCookiesConfig] = useState(false);
   const [showForm, setShowForm] = useState(false);
 
   // Modal actions states
@@ -127,8 +125,7 @@ export default function LiveStreamerPage() {
           rtmpUrl: rtmpUrl.trim(),
           streamKey: streamKey.trim(),
           videoTitle: videoTitle.trim(),
-          loopMode,
-          youtubeCookies: youtubeCookies.trim()
+          loopMode
         })
       });
 
@@ -260,14 +257,14 @@ export default function LiveStreamerPage() {
                     <span className="font-semibold text-rose-300">Stream Initialization Failed</span>
                   </div>
                   <div className="pl-7 text-zinc-400 leading-relaxed">
-                    {actionError.includes("Diagnostics:") || actionError.includes("exited early") ? (
+                    {actionError.includes("Diagnostics:") || actionError.includes("exited early") || actionError.includes("ERROR:") || actionError.includes("Error:") || actionError.includes("\n") ? (
                       <>
                         <p className="mb-2 font-medium text-zinc-300">
-                          {actionError.split("Diagnostics:")[0] || actionError}
+                          {actionError.includes("Diagnostics:") ? actionError.split("Diagnostics:")[0] : "Detailed Error Information:"}
                         </p>
-                        <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider">FFmpeg Error Log & Output:</div>
+                        <div className="text-[10px] uppercase font-bold text-zinc-500 tracking-wider">Error Details / Command Logs:</div>
                         <pre className="bg-black/50 p-3.5 rounded-xl mt-1 font-mono text-red-300 border border-red-950/50 max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-normal shadow-inner">
-                          {actionError.includes("Diagnostics:") ? actionError.split("Diagnostics:")[1].trim() : actionError}
+                          {actionError.includes("Diagnostics:") ? actionError.split("Diagnostics:")[1].trim() : actionError.trim()}
                         </pre>
                       </>
                     ) : (
@@ -363,40 +360,7 @@ export default function LiveStreamerPage() {
                   </div>
                 </div>
 
-                {/* Advanced: YouTube Authentication Cookies */}
-                <div className="border border-zinc-900 rounded-xl bg-zinc-950/40 p-4.5 mt-3">
-                  <button
-                    type="button"
-                    onClick={() => setShowCookiesConfig(!showCookiesConfig)}
-                    className="flex items-center justify-between w-full text-left focus:outline-none"
-                  >
-                    <div>
-                      <span className="text-xs font-black uppercase text-zinc-300 tracking-wider">Advanced: YouTube Auth Cookies</span>
-                      <p className="text-[10px] text-zinc-500 mt-0.5">Use Netscape format cookies to bypass sign-in and bot checks on YouTube links.</p>
-                    </div>
-                    <span className="text-zinc-500 hover:text-white transition-colors text-xs font-bold select-none cursor-pointer">
-                      {showCookiesConfig ? "Hide" : "Configure"}
-                    </span>
-                  </button>
 
-                  {showCookiesConfig && (
-                    <div className="mt-4.5">
-                      <label className="text-[10px] font-bold text-rose-400 uppercase tracking-wider block mb-1.5">
-                        Netscape Cookie File Data
-                      </label>
-                      <textarea
-                        rows={4}
-                        value={youtubeCookies}
-                        onChange={(e) => setYoutubeCookies(e.target.value)}
-                        placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#10;..."
-                        className="w-full px-4 py-3 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-300 text-xs focus:border-indigo-500 outline-none transition-all placeholder-zinc-800 font-mono"
-                      />
-                      <p className="text-[10px] text-zinc-500 mt-1.5 leading-relaxed">
-                        Export cookies from your browser using an extension like "Get cookies.txt" or "EditThisCookie" (Netscape format), and paste the text content here to bypass "Sign in to confirm you're not a bot" errors.
-                      </p>
-                    </div>
-                  )}
-                </div>
 
 
 

@@ -1553,9 +1553,7 @@ app.post("/api/render-video", authenticateUser, async (req: express.Request, res
 // AutoShorts Route
 app.post("/api/process-shorts", authenticateUser, upload.single("video"), async (req, res) => {
   const youtubeUrl = req.body.youtubeUrl;
-  const youtubeCookies = req.body.youtubeCookies;
   let videoPath = req.file?.path;
-  let cookiesPath = "";
   
   if (!videoPath && !youtubeUrl) {
     return res.status(400).json({ error: "Video file or YouTube URL required" });
@@ -1570,12 +1568,6 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
       tempDownloadPath = path.join(process.cwd(), "uploads", `yt_${Date.now()}.mp4`);
       const ytdlpPath = await ensureYtdlp();
       const ytdlp = new YTDlpWrap(ytdlpPath);
-
-      if (youtubeCookies && youtubeCookies.trim()) {
-        cookiesPath = path.join(process.cwd(), "uploads", `cookies_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.txt`);
-        fs.writeFileSync(cookiesPath, youtubeCookies.trim(), "utf8");
-        console.log(`[Shorts] Saved custom YouTube cookies to: ${cookiesPath}`);
-      }
 
       const ytdlpArgs = [];
       
@@ -1626,10 +1618,6 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
             currentArgs.push("--extractor-args", `youtube:player_client=${attempt.client}`);
           }
 
-          if (cookiesPath) {
-            currentArgs.push("--cookies", cookiesPath);
-          }
-
           // Use "--" to prevent video URLs starting with "-" from being treated as options
           currentArgs.push("-o", tempDownloadPath, "--", youtubeUrl);
 
@@ -1669,10 +1657,6 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
     if (req.file?.path && fs.existsSync(req.file.path)) {
         await fs.promises.unlink(req.file.path).catch(() => {});
     }
-    if (cookiesPath && fs.existsSync(cookiesPath)) {
-        await fs.promises.unlink(cookiesPath).catch(() => {});
-    }
-    
     res.json({ videoUrl: `/uploads/${outputFilename}` });
   } catch (err) {
     console.error("Shorts processing failed:", err);
@@ -1684,14 +1668,10 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
     if (req.file?.path && fs.existsSync(req.file.path)) {
         await fs.promises.unlink(req.file.path).catch(() => {});
     }
-    if (cookiesPath && fs.existsSync(cookiesPath)) {
-        await fs.promises.unlink(cookiesPath).catch(() => {});
-    }
-
     const msg = (err as any)?.message || "Failed to process short";
     const isBotCheck = msg.toLowerCase().includes("bot") || msg.toLowerCase().includes("confirm you");
     const errorMsg = isBotCheck
-      ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Please paste Netscape-format YouTube cookies under 'Advanced: YouTube Auth Cookies' to bypass this."
+      ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Extraction blocked by YouTube."
       : msg;
 
     res.status(500).json({ error: errorMsg });
@@ -2697,9 +2677,8 @@ app.post("/api/yt-tools/metadata", async (req: express.Request, res: express.Res
 // POST /api/stream/start
 app.post("/api/stream/start", authenticateUser, async (req: express.Request, res: express.Response) => {
   const userId = (req as any).user?.uid || "anonymous_user";
-  let cookiesPath = "";
   try {
-    const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite", youtubeCookies } = req.body;
+    const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite" } = req.body;
     
     if (!videoSource || !rtmpUrl || !streamKey) {
       return res.status(400).json({ error: "Missing required parameters: videoSource, rtmpUrl, streamKey" });
@@ -2756,12 +2735,6 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
         
         const videoUrl = videoSource;
 
-        if (youtubeCookies && youtubeCookies.trim()) {
-          cookiesPath = path.join(process.cwd(), `cookies_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.txt`);
-          fs.writeFileSync(cookiesPath, youtubeCookies.trim(), "utf8");
-          console.log(`[Live Stream] Saved custom YouTube cookies to: ${cookiesPath}`);
-        }
-
         const clientAttempts = [
           "android,tv",
           "tv_embedded,web_embedded",
@@ -2779,9 +2752,6 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
             '--no-check-certificates', 
             '--js-runtimes', 'node'
           ];
-          if (cookiesPath) {
-            ytDlpArgs.push('--cookies', cookiesPath);
-          }
           ytDlpArgs.push(videoUrl);
 
           console.log(`[Live Stream] Invoking standard yt-dlp with client: ${client} (Attempt ${attemptIdx + 1}/${clientAttempts.length})`);
@@ -2921,9 +2891,6 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
                     `--no-check-certificates`,
                     `--proxy "${proxyUrl}"`
                   ];
-                  if (cookiesPath) {
-                    cmdArgs.push(`--cookies "${cookiesPath}"`);
-                  }
                   cmdArgs.push(`"${videoSource}"`);
                   const cmd = cmdArgs.join(" ");
 
@@ -3300,13 +3267,6 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
   } catch (error: any) {
     console.error("[Live Stream] Failed to start live restream:", error);
     res.status(500).json({ error: error.message || "Failed to launch streaming loop" });
-  } finally {
-    if (cookiesPath && fs.existsSync(cookiesPath)) {
-      try {
-        fs.unlinkSync(cookiesPath);
-        console.log(`[Live Stream] Cleaned up temporary cookies file in finally block: ${cookiesPath}`);
-      } catch (e) {}
-    }
   }
 });
 
