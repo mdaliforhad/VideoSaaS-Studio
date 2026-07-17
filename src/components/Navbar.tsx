@@ -15,8 +15,6 @@ export default function Navbar() {
   const [rtmpUrl, setRtmpUrl] = React.useState("");
   const [streamKey, setStreamKey] = React.useState("");
   const [loopMode, setLoopMode] = React.useState("infinite");
-  const [youtubeCookies, setYoutubeCookies] = React.useState("");
-  const [showCookiesConfig, setShowCookiesConfig] = React.useState(false);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [errorMessage, setErrorMessage] = React.useState("");
   const [successMessage, setSuccessMessage] = React.useState("");
@@ -40,8 +38,7 @@ export default function Navbar() {
           rtmpUrl,
           streamKey,
           videoTitle,
-          loopMode,
-          youtubeCookies: youtubeCookies.trim()
+          loopMode
         })
       });
 
@@ -312,40 +309,7 @@ export default function Navbar() {
                 </select>
               </div>
 
-              {/* Advanced: YouTube Auth Cookies */}
-              <div className="border border-zinc-900 rounded-xl bg-zinc-950/40 p-4 mt-3">
-                <button
-                  type="button"
-                  onClick={() => setShowCookiesConfig(!showCookiesConfig)}
-                  className="flex items-center justify-between w-full text-left focus:outline-none"
-                >
-                  <div>
-                    <span className="text-xs font-black uppercase text-zinc-300 tracking-wider">Advanced: YouTube Auth Cookies</span>
-                    <p className="text-[10px] text-zinc-500 mt-0.5">Paste Netscape format cookies to bypass bot checks on YouTube links.</p>
-                  </div>
-                  <span className="text-zinc-500 hover:text-white transition-colors text-xs font-bold select-none cursor-pointer">
-                    {showCookiesConfig ? "Hide" : "Configure"}
-                  </span>
-                </button>
 
-                {showCookiesConfig && (
-                  <div className="mt-3">
-                    <label className="text-[10px] font-bold text-rose-400 uppercase tracking-wider block mb-1.5">
-                      Netscape Cookie File Data
-                    </label>
-                    <textarea
-                      rows={3}
-                      value={youtubeCookies}
-                      onChange={(e) => setYoutubeCookies(e.target.value)}
-                      placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#10;..."
-                      className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-300 text-xs focus:outline-none focus:border-indigo-500 transition-colors placeholder-zinc-800 font-mono"
-                    />
-                    <p className="text-[10px] text-zinc-500 mt-1.5 leading-relaxed">
-                      Paste exported cookies to bypass "Sign in to confirm you're not a bot" errors.
-                    </p>
-                  </div>
-                )}
-              </div>
 
 
 

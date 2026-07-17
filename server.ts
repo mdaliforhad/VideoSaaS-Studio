@@ -1553,6 +1553,7 @@ app.post("/api/render-video", authenticateUser, async (req: express.Request, res
 // AutoShorts Route
 app.post("/api/process-shorts", authenticateUser, upload.single("video"), async (req, res) => {
   const youtubeUrl = req.body.youtubeUrl;
+  const youtubeCookies = req.body.youtubeCookies;
   let videoPath = req.file?.path;
   
   if (!videoPath && !youtubeUrl) {
@@ -1569,7 +1570,7 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
       const ytdlpPath = await ensureYtdlp();
       const ytdlp = new YTDlpWrap(ytdlpPath);
 
-      const ytdlpArgs = [];
+      const cookieFilePath = createTempCookieFile(youtubeCookies);
       
       // Try multiple extraction attempts to download the video successfully
       const extractionAttempts = [
@@ -1602,40 +1603,48 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
       let success = false;
       let lastError: any = null;
 
-      for (let attemptIdx = 0; attemptIdx < extractionAttempts.length; attemptIdx++) {
-        const attempt = extractionAttempts[attemptIdx];
-        try {
-          console.log(`[Shorts] Attempting download (${attemptIdx + 1}/${extractionAttempts.length}, client: ${attempt.client || "default"})...`);
-          
-          const currentArgs = [
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "--js-runtimes", "node",
-            "--user-agent", attempt.ua,
-            "--no-playlist"
-          ];
+      try {
+        for (let attemptIdx = 0; attemptIdx < extractionAttempts.length; attemptIdx++) {
+          const attempt = extractionAttempts[attemptIdx];
+          try {
+            console.log(`[Shorts] Attempting download (${attemptIdx + 1}/${extractionAttempts.length}, client: ${attempt.client || "default"})...`);
+            
+            const currentArgs = [
+              "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+              "--js-runtimes", "node",
+              "--user-agent", attempt.ua,
+              "--no-playlist"
+            ];
 
-          if (attempt.client) {
-            currentArgs.push("--extractor-args", `youtube:player_client=${attempt.client}`);
+            if (cookieFilePath) {
+              currentArgs.push("--cookies", cookieFilePath);
+            }
+
+            if (attempt.client) {
+              currentArgs.push("--extractor-args", `youtube:player_client=${attempt.client}`);
+            }
+
+            // Use "--" to prevent video URLs starting with "-" from being treated as options
+            currentArgs.push("-o", tempDownloadPath, "--", youtubeUrl);
+
+            await new Promise<void>((resolve, reject) => {
+              ytdlp.exec(currentArgs)
+                   .on("error", reject)
+                   .on("close", resolve);
+            });
+
+            if (fs.existsSync(tempDownloadPath) && fs.statSync(tempDownloadPath).size > 0) {
+              console.log(`[Shorts] Download success using attempt ${attemptIdx + 1}`);
+              success = true;
+              break;
+            }
+          } catch (err: any) {
+            console.warn(`[Shorts] Attempt ${attemptIdx + 1} failed:`, err.message || err);
+            lastError = err;
           }
-
-          // Use "--" to prevent video URLs starting with "-" from being treated as options
-          currentArgs.push("-o", tempDownloadPath, "--", youtubeUrl);
-
-          await new Promise<void>((resolve, reject) => {
-            ytdlp.exec(currentArgs)
-                 .on("error", reject)
-                 .on("close", resolve);
-          });
-
-          if (fs.existsSync(tempDownloadPath) && fs.statSync(tempDownloadPath).size > 0) {
-            console.log(`[Shorts] Download success using attempt ${attemptIdx + 1}`);
-            success = true;
-            break;
-          }
-        } catch (err: any) {
-          console.warn(`[Shorts] Attempt ${attemptIdx + 1} failed:`, err.message || err);
-          lastError = err;
         }
+      } finally {
+        cleanupTempFile(cookieFilePath);
       }
 
       if (!success) {
@@ -2089,6 +2098,27 @@ function analyzeCrashReason(lines: string[], code: number | null): string {
     return errorLine;
   }
   return code !== null ? `FFmpeg exited with error code ${code}.` : "FFmpeg terminated unexpectedly.";
+}
+
+// Helper to manage temporary cookies files for yt-dlp authentication
+function createTempCookieFile(cookiesContent: string | undefined): string | null {
+  if (!cookiesContent || !cookiesContent.trim()) {
+    return null;
+  }
+  const tempDir = os.tmpdir();
+  const filePath = path.join(tempDir, `youtube_cookies_${Date.now()}_${Math.random().toString(36).substring(7)}.txt`);
+  fs.writeFileSync(filePath, cookiesContent.trim(), "utf-8");
+  return filePath;
+}
+
+function cleanupTempFile(filePath: string | null) {
+  if (filePath && fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      console.warn(`[Cleanup] Failed to delete temp file ${filePath}:`, e);
+    }
+  }
 }
 
 // Ensure yt-dlp is available or download it on the fly
@@ -2678,7 +2708,7 @@ app.post("/api/yt-tools/metadata", async (req: express.Request, res: express.Res
 app.post("/api/stream/start", authenticateUser, async (req: express.Request, res: express.Response) => {
   const userId = (req as any).user?.uid || "anonymous_user";
   try {
-    const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite" } = req.body;
+    const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite", youtubeCookies } = req.body;
     
     if (!videoSource || !rtmpUrl || !streamKey) {
       return res.status(400).json({ error: "Missing required parameters: videoSource, rtmpUrl, streamKey" });
@@ -2726,6 +2756,7 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
     } else if (videoSource.includes("youtube.com") || videoSource.includes("youtu.be")) {
       isYt = true;
       console.log(`[Live Stream] YouTube source requested: ${videoSource}. Resolving stream url...`);
+      const cookieFilePath = createTempCookieFile(youtubeCookies);
       try {
         const ytdlpPath = await ensureYtdlp();
         const ytDlpWrap = new YTDlpWrap(ytdlpPath);
@@ -2742,32 +2773,36 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
           "tv,ios,web"
         ];
 
-        for (let attemptIdx = 0; attemptIdx < clientAttempts.length; attemptIdx++) {
-          const client = clientAttempts[attemptIdx];
-          const ytDlpArgs = [
-            '-g', 
-            '-f', 'bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]', 
-            '--extractor-args', `youtube:player_client=${client}`, 
-            '--geo-bypass', 
-            '--no-check-certificates', 
-            '--js-runtimes', 'node'
-          ];
-          ytDlpArgs.push(videoUrl);
-
-          console.log(`[Live Stream] Invoking standard yt-dlp with client: ${client} (Attempt ${attemptIdx + 1}/${clientAttempts.length})`);
-          try {
-            const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
-            const resVal = stdout ? stdout.trim() : "";
-            if (resVal && resVal.startsWith("http")) {
-              resolved = resVal;
-              console.log(`[Live Stream] Standard extraction SUCCESS with client: ${client}!`);
-              break;
+        try {
+          for (let attemptIdx = 0; attemptIdx < clientAttempts.length; attemptIdx++) {
+            const client = clientAttempts[attemptIdx];
+            const ytDlpArgs = [
+              '-g', 
+              '-f', 'bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]', 
+              '--extractor-args', `youtube:player_client=${client}`, 
+              '--geo-bypass', 
+              '--no-check-certificates', 
+              '--js-runtimes', 'node'
+            ];
+            if (cookieFilePath) {
+              ytDlpArgs.push('--cookies', cookieFilePath);
             }
-          } catch (err: any) {
-            originalError = err.message || String(err);
-            console.log(`[Live Stream] Extraction with client: ${client} failed: ${originalError}`);
+            ytDlpArgs.push(videoUrl);
+
+            console.log(`[Live Stream] Invoking standard yt-dlp with client: ${client} (Attempt ${attemptIdx + 1}/${clientAttempts.length})`);
+            try {
+              const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
+              const resVal = stdout ? stdout.trim() : "";
+              if (resVal && resVal.startsWith("http")) {
+                resolved = resVal;
+                console.log(`[Live Stream] Standard extraction SUCCESS with client: ${client}!`);
+                break;
+              }
+            } catch (err: any) {
+              originalError = err.message || String(err);
+              console.log(`[Live Stream] Extraction with client: ${client} failed: ${originalError}`);
+            }
           }
-        }
         
         if (!resolved) {
           console.log("[Live Stream] Initiating secondary proxy rotation backup pass...");
@@ -2889,11 +2924,14 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
                     `--geo-bypass`,
                     `--js-runtimes node`,
                     `--no-check-certificates`,
-                    `--proxy "${proxyUrl}"`
                   ];
+                  if (cookieFilePath) {
+                    cmdArgs.push(`--cookies "${cookieFilePath}"`);
+                  }
+                  cmdArgs.push(`--proxy "${proxyUrl}"`);
                   cmdArgs.push(`"${videoSource}"`);
                   const cmd = cmdArgs.join(" ");
-
+ 
                   exec(cmd, { timeout: 25000 }, (err, stdout, stderr) => {
                     if (!err && stdout) {
                       const resVal = stdout.trim();
@@ -2921,6 +2959,10 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
             console.log("[Live Stream] Info: Proxy rotation backup pass concluded.");
           }
         }
+      } finally {
+        cleanupTempFile(cookieFilePath);
+      }
+
         
         if (resolved && resolved.startsWith("http")) {
           const lines = resolved.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0 && l.startsWith("http"));
@@ -2946,8 +2988,8 @@ app.post("/api/stream/start", authenticateUser, async (req: express.Request, res
           const msg = err.message || "Failed to resolve YouTube stream.";
           const isBotCheck = msg.toLowerCase().includes("bot") || msg.toLowerCase().includes("confirm you");
           const errorMsg = isBotCheck
-            ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Please paste Netscape-format YouTube cookies under 'Advanced: YouTube Auth Cookies' to bypass this."
-            : msg;
+            ? `YouTube bot-check triggered (Sign in to confirm you're not a bot). Extraction was blocked by YouTube. Please use a direct video URL (MP4) or another supported source.\n\nDiagnostics:\n${msg}`
+            : `YouTube stream resolution failed.\n\nDiagnostics:\n${msg}`;
           
           return res.status(400).json({ error: errorMsg });
         }

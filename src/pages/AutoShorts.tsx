@@ -12,15 +12,7 @@ export default function AutoShorts() {
   const [engine, setEngine] = useState("gemini-1.5-flash");
   const [driveConnected, setDriveConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [youtubeCookies, setYoutubeCookies] = useState<string>(() => {
-    return localStorage.getItem("stream_youtubeCookies") || "";
-  });
-  const [showCookiesConfig, setShowCookiesConfig] = useState(false);
 
-  useEffect(() => {
-    localStorage.setItem("stream_youtubeCookies", youtubeCookies);
-  }, [youtubeCookies]);
-  
   useEffect(() => {
     if (user) {
         user.getIdToken().then(token => {
@@ -49,10 +41,6 @@ export default function AutoShorts() {
     if (file) formData.append("video", file);
     if (youtubeUrl) formData.append("youtubeUrl", youtubeUrl);
     formData.append("engine", engine);
-
-    if (youtubeCookies.trim()) {
-      formData.append("youtubeCookies", youtubeCookies.trim());
-    }
 
     try {
       const headers: Record<string, string> = {};
@@ -120,43 +108,16 @@ export default function AutoShorts() {
 
               <input 
                 type="text" 
-                placeholder="https://youtube.com/..." 
+                placeholder="https://youtube.com/... or direct video .mp4 URL" 
                 value={youtubeUrl}
                 onChange={(e) => { setYoutubeUrl(e.target.value); setFile(null); }}
                 className="w-full bg-zinc-800 border border-zinc-700 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500"
               />
+              <p className="text-[10px] text-zinc-500 leading-normal font-mono mt-1">
+                💡 <strong>Source Tip:</strong> Upload a long video file directly using the box above for 100% reliability. Direct video MP4 URLs also work perfectly. YouTube link extraction is frequently restricted by bot challenges on cloud hosting environments.
+              </p>
 
-              {/* ADVANCED AUTH: YOUTUBE COOKIES FOR BYPASSING BOT CHECKS */}
-              <div className="bg-zinc-900/40 border border-zinc-800/50 rounded-xl p-4 space-y-3">
-                <button
-                  type="button"
-                  onClick={() => setShowCookiesConfig(!showCookiesConfig)}
-                  className="flex items-center justify-between w-full text-left text-xs font-bold text-zinc-300 uppercase tracking-wider hover:text-white transition-all cursor-pointer"
-                >
-                  <span className="flex items-center gap-2">
-                    <Key className="w-3.5 h-3.5 text-indigo-400" />
-                    Advanced: YouTube Auth Cookies (Bypass Bot Challenges)
-                  </span>
-                  <span className="text-xs text-indigo-400 font-mono">
-                    {showCookiesConfig ? "Collapse" : "Expand"}
-                  </span>
-                </button>
-                
-                {showCookiesConfig && (
-                  <div className="space-y-2 pt-1">
-                    <p className="text-[10px] text-zinc-500 leading-normal font-mono">
-                      If stream extraction fails with <code className="text-rose-400">Sign in to confirm you're not a bot</code>, export your browser's YouTube cookies in Netscape format (using browser extensions like "Get cookies.txt LOCALLY" or standard Netscape cookies exporters) and paste them below.
-                    </p>
-                    <textarea
-                      placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#10;TRUE&#10;/&#10;FALSE&#10;..."
-                      rows={4}
-                      value={youtubeCookies}
-                      onChange={(e) => setYoutubeCookies(e.target.value)}
-                      className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-300 text-[11px] focus:border-indigo-500 outline-none transition-all font-mono placeholder-zinc-800"
-                    />
-                  </div>
-                )}
-              </div>
+
               
               <label className="block text-sm font-bold text-zinc-300">AI Engine</label>
               <select 

@@ -49,6 +49,7 @@ export default function LiveStreamerPage() {
   const [streamKey, setStreamKey] = useState(() => localStorage.getItem("stream_streamKey") || "");
   const [videoTitle, setVideoTitle] = useState("");
   const [loopMode, setLoopMode] = useState<"infinite" | "once">("infinite");
+  const [youtubeCookies, setYoutubeCookies] = useState(() => localStorage.getItem("stream_youtubeCookies") || "");
   const [showForm, setShowForm] = useState(false);
 
   // Modal actions states
@@ -96,7 +97,8 @@ export default function LiveStreamerPage() {
     localStorage.setItem("stream_videoUrl", videoUrl);
     localStorage.setItem("stream_rtmpUrl", rtmpUrl);
     localStorage.setItem("stream_streamKey", streamKey);
-  }, [videoUrl, rtmpUrl, streamKey]);
+    localStorage.setItem("stream_youtubeCookies", youtubeCookies);
+  }, [videoUrl, rtmpUrl, streamKey, youtubeCookies]);
 
   // Start stream action
   const handleStartStream = async (e: React.FormEvent) => {
@@ -125,7 +127,8 @@ export default function LiveStreamerPage() {
           rtmpUrl: rtmpUrl.trim(),
           streamKey: streamKey.trim(),
           videoTitle: videoTitle.trim(),
-          loopMode
+          loopMode,
+          youtubeCookies: youtubeCookies.trim() || undefined
         })
       });
 
@@ -321,6 +324,24 @@ export default function LiveStreamerPage() {
                       onChange={(e) => setVideoUrl(e.target.value)}
                       className="w-full px-4 py-2.5 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-100 text-xs focus:border-indigo-500 outline-none transition-all placeholder-zinc-700"
                     />
+                    <p className="text-[10px] text-zinc-500 leading-normal font-mono mt-1.5">
+                      💡 <strong>Source Tip:</strong> Public Google Drive files, Dropbox video URLs, and direct MP4/WebM video feeds play flawlessly. YouTube extractions are frequently blocked by YouTube bot-checks in cloud server environments.
+                    </p>
+                    
+                    {(videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) && (
+                      <div className="mt-4 space-y-1.5">
+                        <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider block">
+                          YouTube Cookies (Optional)
+                        </label>
+                        <textarea
+                          placeholder="Paste Netscape cookies.txt here to bypass YouTube bot detection (Sign in to confirm you're not a bot)..."
+                          value={youtubeCookies}
+                          onChange={(e) => setYoutubeCookies(e.target.value)}
+                          rows={3}
+                          className="w-full px-3 py-2 bg-zinc-950 border border-zinc-800 rounded-xl text-zinc-200 font-mono text-[10px] focus:border-indigo-500 outline-none transition-all placeholder-zinc-700 leading-relaxed resize-y"
+                        />
+                      </div>
+                    )}
                   </div>
                 </div>
 
