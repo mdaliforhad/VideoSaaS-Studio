@@ -1622,12 +1622,12 @@ app.post("/api/process-shorts", authenticateUser, upload.single("video"), async 
             "--no-playlist"
           ];
 
-          if (cookiesPath) {
-            currentArgs.push("--cookies", cookiesPath);
-          }
-
           if (attempt.client) {
             currentArgs.push("--extractor-args", `youtube:player_client=${attempt.client}`);
+          }
+
+          if (cookiesPath) {
+            currentArgs.push("--cookies", cookiesPath);
           }
 
           // Use "--" to prevent video URLs starting with "-" from being treated as options
@@ -2052,18 +2052,26 @@ app.post("/api/voice/clone-free", async (req: express.Request, res: express.Resp
 });
 
 // 24/7 Live Restreamer State and APIs
-let liveStreamProcess: ChildProcess | null = null;
-let liveStreamState = {
-  isLive: false,
-  startTime: null as number | null,
-  videoSource: "",
-  rtmpUrl: "",
-  streamKey: "",
-  activeVideoTitle: "",
-  streamToken: "",
-  errorLog: [] as string[],
-  lastCrashReason: "",
-};
+interface StreamState {
+  streamId: string;
+  userId: string;
+  isLive: boolean;
+  startTime: number | null;
+  videoSource: string;
+  rtmpUrl: string;
+  streamKey: string;
+  activeVideoTitle: string;
+  streamToken: string;
+  errorLog: string[];
+  lastCrashReason: string;
+}
+
+interface ActiveStream {
+  process: ChildProcess | null;
+  state: StreamState;
+}
+
+const activeStreams = new Map<string, ActiveStream>();
 
 // Helper to analyze the FFmpeg stderr output and identify the specific crash reason
 function analyzeCrashReason(lines: string[], code: number | null): string {
@@ -2118,15 +2126,41 @@ async function ensureYtdlp(): Promise<string> {
 }
 
 // GET /api/stream/status
-app.get("/api/stream/status", (req: express.Request, res: express.Response) => {
-  let uptime = 0;
-  if (liveStreamState.isLive && liveStreamState.startTime) {
-    uptime = Math.floor((Date.now() - liveStreamState.startTime) / 1000);
-  }
+app.get("/api/stream/status", authenticateUser, (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user?.uid || "anonymous_user";
+  
+  // Return all active streams for the authenticated user (or all if in dev)
+  const userStreams = Array.from(activeStreams.values())
+    .filter(s => s.state.userId === userId || process.env.NODE_ENV === 'development')
+    .map(s => {
+      const uptime = s.state.startTime ? Math.floor((Date.now() - s.state.startTime) / 1000) : 0;
+      return {
+        ...s.state,
+        uptime
+      };
+    });
+    
   res.json({
-    ...liveStreamState,
-    uptime
+    streams: userStreams
   });
+});
+
+// GET /api/streams (Public Live Directory)
+app.get("/api/streams", async (req: express.Request, res: express.Response) => {
+  try {
+    const snapshot = await getFirestore()
+      .collection("live_streams")
+      .where("status", "==", "live")
+      .get();
+    const streams = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+    res.json(streams);
+  } catch (error: any) {
+    console.error("[Live Stream] Error fetching public streams:", error);
+    res.status(500).json({ error: error.message || "Failed to fetch public streams" });
+  }
 });
 
 // GET /api/stream/keep-alive
@@ -2141,7 +2175,7 @@ app.get("/api/stream/keep-alive", (req: express.Request, res: express.Response) 
   res.write(`data: ${JSON.stringify({ status: "connected", timestamp: Date.now() })}\n\n`);
   
   const interval = setInterval(() => {
-    res.write(`data: ${JSON.stringify({ status: "ping", isLive: liveStreamState.isLive, timestamp: Date.now() })}\n\n`);
+    res.write(`data: ${JSON.stringify({ status: "ping", timestamp: Date.now() })}\n\n`);
   }, 10000);
   
   req.on("close", () => {
@@ -2150,33 +2184,77 @@ app.get("/api/stream/keep-alive", (req: express.Request, res: express.Response) 
 });
 
 // POST /api/stream/stop
-app.post("/api/stream/stop", (req: express.Request, res: express.Response) => {
-  const { streamToken } = req.body;
-  console.log(`[Live Stream] Stop requested. Provided token: ${streamToken}, active token: ${liveStreamState.streamToken}`);
+app.post("/api/stream/stop", authenticateUser, async (req: express.Request, res: express.Response) => {
+  const { streamId } = req.body;
+  const userId = (req as any).user?.uid || "anonymous_user";
+  console.log(`[Live Stream] Stop requested for streamId: ${streamId} by userId: ${userId}`);
   
-  if (liveStreamProcess) {
-    try {
-      liveStreamProcess.kill("SIGKILL");
-      console.log("[Live Stream] Sent SIGKILL to active FFmpeg process.");
-    } catch (err) {
-      console.error("[Live Stream] Error killing FFmpeg process:", err);
-    }
-    liveStreamProcess = null;
+  if (!streamId) {
+    return res.status(400).json({ error: "Missing required parameter: streamId" });
   }
-  
-  // Failsafe: kill any background ffmpeg streams spawned by us to prevent process leakage
+
+  const activeStream = activeStreams.get(streamId);
+  if (activeStream) {
+    // Check ownership if not dev/admin
+    if (activeStream.state.userId !== userId && process.env.NODE_ENV !== 'development') {
+      return res.status(403).json({ error: "Forbidden: You are not the owner of this stream." });
+    }
+
+    if (activeStream.process) {
+      try {
+        activeStream.process.kill("SIGKILL");
+        console.log(`[Live Stream] Killed FFmpeg process for streamId: ${streamId}`);
+      } catch (err) {
+        console.error(`[Live Stream] Error killing process for streamId ${streamId}:`, err);
+      }
+    }
+    activeStream.state.isLive = false;
+    activeStream.state.startTime = null;
+    activeStream.process = null;
+    activeStreams.delete(streamId);
+  }
+
+  // Update in Firestore as well
   try {
-    execSync("pkill -9 -f ffmpeg");
-    console.log("[Live Stream] Cleaned up all background ffmpeg processes.");
-  } catch (e) {}
-  
-  liveStreamState.isLive = false;
-  liveStreamState.startTime = null;
-  liveStreamState.streamToken = "";
-  liveStreamState.errorLog = [];
-  
+    await getFirestore().collection("live_streams").doc(streamId).update({
+      status: "ended",
+      endedAt: new Date().toISOString()
+    });
+    console.log(`[Live Stream] Document updated to 'ended' in Firestore for streamId: ${streamId}`);
+  } catch (fireErr: any) {
+    console.error(`[Live Stream] Error updating document to ended in Firestore for streamId ${streamId}:`, fireErr);
+  }
+
   res.json({ success: true, message: "Stream stopped successfully!" });
 });
+
+// Auto-cleanup: Runs every hour, deletes live_streams documents where status == 'ended' and endedAt is older than 24 hours.
+setInterval(async () => {
+  try {
+    console.log("[Live Stream Cleanup] Running auto-cleanup task for ended streams...");
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const snapshot = await getFirestore()
+      .collection("live_streams")
+      .where("status", "==", "ended")
+      .where("endedAt", "<", oneDayAgo)
+      .get();
+    
+    if (snapshot.empty) {
+      console.log("[Live Stream Cleanup] No expired ended streams found.");
+      return;
+    }
+
+    const batch = getFirestore().batch();
+    snapshot.docs.forEach(doc => {
+      console.log(`[Live Stream Cleanup] Deleting expired stream document: ${doc.id}`);
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+    console.log(`[Live Stream Cleanup] Successfully deleted ${snapshot.size} expired stream documents.`);
+  } catch (err) {
+    console.error("[Live Stream Cleanup] Error during auto-cleanup:", err);
+  }
+}, 60 * 60 * 1000); // Run every hour
 
 // Helper to request metadata via public YouTube oEmbed (cookie-free, bypasses bot verification blocks)
 function fetchOEmbedMetadata(videoUrl: string): Promise<any> {
@@ -2617,7 +2695,8 @@ app.post("/api/yt-tools/metadata", async (req: express.Request, res: express.Res
 });
 
 // POST /api/stream/start
-app.post("/api/stream/start", async (req: express.Request, res: express.Response) => {
+app.post("/api/stream/start", authenticateUser, async (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user?.uid || "anonymous_user";
   let cookiesPath = "";
   try {
     const { videoSource, rtmpUrl, streamKey, videoTitle, loopMode = "infinite", youtubeCookies } = req.body;
@@ -2626,12 +2705,28 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
       return res.status(400).json({ error: "Missing required parameters: videoSource, rtmpUrl, streamKey" });
     }
     
-    // Stop existing stream if running
-    if (liveStreamProcess) {
-      try {
-        liveStreamProcess.kill("SIGKILL");
-      } catch (e) {}
-      liveStreamProcess = null;
+    // Stop existing stream with exact same target if running to avoid ingestion conflicts
+    for (const [sid, active] of activeStreams.entries()) {
+      if (active.state.rtmpUrl === rtmpUrl && active.state.streamKey === streamKey) {
+        console.log(`[Live Stream] Target conflict detected for streamId: ${sid}. Stopping previous stream.`);
+        if (active.process) {
+          try {
+            active.process.kill("SIGKILL");
+          } catch (e) {}
+        }
+        active.state.isLive = false;
+        active.state.startTime = null;
+        active.process = null;
+        activeStreams.delete(sid);
+        
+        // Update Firestore status
+        try {
+          await getFirestore().collection("live_streams").doc(sid).update({
+            status: "ended",
+            endedAt: new Date().toISOString()
+          });
+        } catch (err) {}
+      }
     }
     
     let resolvedVideoUrl = videoSource;
@@ -2660,29 +2755,48 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         let originalError = "";
         
         const videoUrl = videoSource;
+
         if (youtubeCookies && youtubeCookies.trim()) {
           cookiesPath = path.join(process.cwd(), `cookies_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.txt`);
           fs.writeFileSync(cookiesPath, youtubeCookies.trim(), "utf8");
           console.log(`[Live Stream] Saved custom YouTube cookies to: ${cookiesPath}`);
         }
 
-        const ytDlpArgs = ['-g', '-f', 'bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]', '--extractor-args', 'youtube:player_client=tv,ios,web', '--geo-bypass', '--no-check-certificates', '--js-runtimes', 'node'];
-        if (cookiesPath) {
-          ytDlpArgs.push('--cookies', cookiesPath);
-        }
-        ytDlpArgs.push(videoUrl);
+        const clientAttempts = [
+          "android,tv",
+          "tv_embedded,web_embedded",
+          "android_embedded,ios_embedded",
+          "tv,ios,web"
+        ];
 
-        console.log(`[Live Stream] Invoking standard yt-dlp with Web/iOS client and custom cookies: ${ytDlpArgs.join(" ")}`);
-        try {
-          const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
-          const resVal = stdout ? stdout.trim() : "";
-          if (resVal && resVal.startsWith("http")) {
-            resolved = resVal;
-            console.log(`[Live Stream] Standard Web/iOS extraction SUCCESS!`);
+        for (let attemptIdx = 0; attemptIdx < clientAttempts.length; attemptIdx++) {
+          const client = clientAttempts[attemptIdx];
+          const ytDlpArgs = [
+            '-g', 
+            '-f', 'bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]', 
+            '--extractor-args', `youtube:player_client=${client}`, 
+            '--geo-bypass', 
+            '--no-check-certificates', 
+            '--js-runtimes', 'node'
+          ];
+          if (cookiesPath) {
+            ytDlpArgs.push('--cookies', cookiesPath);
           }
-        } catch (err: any) {
-          originalError = err.message || String(err);
-          console.log(`[Live Stream] Standard Web/iOS extraction did not resolve direct stream directly: ${originalError}`);
+          ytDlpArgs.push(videoUrl);
+
+          console.log(`[Live Stream] Invoking standard yt-dlp with client: ${client} (Attempt ${attemptIdx + 1}/${clientAttempts.length})`);
+          try {
+            const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
+            const resVal = stdout ? stdout.trim() : "";
+            if (resVal && resVal.startsWith("http")) {
+              resolved = resVal;
+              console.log(`[Live Stream] Standard extraction SUCCESS with client: ${client}!`);
+              break;
+            }
+          } catch (err: any) {
+            originalError = err.message || String(err);
+            console.log(`[Live Stream] Extraction with client: ${client} failed: ${originalError}`);
+          }
         }
         
         if (!resolved) {
@@ -2801,7 +2915,7 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
                     `"${ytdlpPath}"`,
                     `-g`,
                     `-f "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]"`,
-                    `--extractor-args "youtube:player_client=tv,ios,web"`,
+                    `--extractor-args "youtube:player_client=android,tv"`,
                     `--geo-bypass`,
                     `--js-runtimes node`,
                     `--no-check-certificates`,
@@ -2868,12 +2982,6 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
             ? "YouTube bot-check triggered (Sign in to confirm you're not a bot). Please paste Netscape-format YouTube cookies under 'Advanced: YouTube Auth Cookies' to bypass this."
             : msg;
           
-          if (cookiesPath && fs.existsSync(cookiesPath)) {
-            try {
-              fs.unlinkSync(cookiesPath);
-              console.log(`[Live Stream] Cleaned up temporary cookies file inside catch: ${cookiesPath}`);
-            } catch (e) {}
-          }
           return res.status(400).json({ error: errorMsg });
         }
 
@@ -2895,13 +3003,6 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
         }
         
         resolvedVideoUrl = fallbackUrl;
-      } finally {
-        if (cookiesPath && fs.existsSync(cookiesPath)) {
-          try {
-            fs.unlinkSync(cookiesPath);
-            console.log(`[Live Stream] Cleaned up temporary cookies file: ${cookiesPath}`);
-          } catch (e) {}
-        }
       }
     }
 
@@ -2925,19 +3026,7 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
     }
     
     // Spawn FFmpeg helper with automatic fallback from COPY to TRANSCODE mode
-    function spawnFFmpeg(resolvedUrl: string, resolvedAudioUrl: string, useCopy: boolean) {
-      // Cleanup existing processes
-      try {
-        execSync("pkill -f ffmpeg");
-      } catch (e) {
-        // Ignore errors if process not found
-      }
-      try {
-        execSync("pkill -f yt-dlp");
-      } catch (e) {
-        // Ignore errors if process not found
-      }
-      
+    function spawnFFmpeg(streamId: string, resolvedUrl: string, resolvedAudioUrl: string, useCopy: boolean) {
       const args: string[] = [];
       
       // Global / Input configuration: stream looping
@@ -2996,54 +3085,9 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
 
       args.push("-f", "flv", targetUrl);
       
-      console.log(`[Live Stream] Spawning FFmpeg (mode: ${useCopy ? 'COPY' : 'TRANSCODE'}, direct-input) to restream to ${rtmpUrl}`);
+      console.log(`[Live Stream] [${streamId}] Spawning FFmpeg (mode: ${useCopy ? 'COPY' : 'TRANSCODE'}, direct-input) to restream to ${rtmpUrl}`);
       
-      let transitioningToMock = false;
       let errorLines: string[] = [];
-
-      function spawnMockStream(resolvedUrl: string) {
-        // Direct stream to the null device using FFmpeg. It discards output but keeps processing the input at real-time (-re) speed!
-        const args = [
-          "-re",
-          "-stream_loop", "-1",
-          "-i", resolvedUrl,
-          "-c:v", "libx264",
-          "-pix_fmt", "yuv420p",
-          "-preset", "ultrafast",
-          "-b:v", "200k",
-          "-c:a", "aac",
-          "-f", "null",
-          "-"
-        ];
-        console.log(`[Live Stream] Standby loopback stream active. Maintaining 24/7 mock broadcast.`);
-        const proc = spawn(FFMPEG_PATH, args, {
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"]
-        });
-        proc.unref();
-        
-        proc.stderr?.on("data", (data) => {
-          // Suppress logs for the mock stream to keep output completely clean and error-free
-        });
-        
-        proc.on("close", (code) => {
-          console.log(`[Live Stream] Standby stream closed with code ${code}`);
-          if (liveStreamState.isLive) {
-            // Auto-respawn to keep running 24/7
-            setTimeout(() => {
-              if (liveStreamState.isLive) {
-                liveStreamProcess = spawnMockStream(resolvedUrl);
-              }
-            }, 1000);
-          }
-        });
-        
-        proc.on("error", (err) => {
-          console.log("[Live Stream] Standby stream handover active.");
-        });
-        
-        return proc;
-      }
 
       // Spawning detached so it runs in its own process group, ignoring terminal signals
       const proc = spawn(FFMPEG_PATH, args, {
@@ -3064,7 +3108,11 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
             errorLines.shift();
           }
         }
-        liveStreamState.errorLog = [...errorLines];
+        
+        const currentActive = activeStreams.get(streamId);
+        if (currentActive) {
+          currentActive.state.errorLog = [...errorLines];
+        }
         
         if (logLine.includes("frame=") || logLine.includes("bitrate=")) {
           // quiet progress lines
@@ -3074,82 +3122,191 @@ app.post("/api/stream/start", async (req: express.Request, res: express.Response
                                        logLine.toLowerCase().includes("failed") || 
                                        logLine.toLowerCase().includes("timeout");
           if (!containsErrorKeyword) {
-            console.log(`[FFmpeg Stream] ${logLine.trim()}`);
+            console.log(`[FFmpeg Stream - ${streamId}] ${logLine.trim()}`);
           }
         }
       });
       
-      proc.on("close", (code) => {
-        console.log(`[Live Stream] FFmpeg process closed with code ${code}`);
-        if (transitioningToMock) {
-          // Handled by mock stream
-          return;
-        }
+      proc.on("close", async (code) => {
+        console.log(`[Live Stream] [${streamId}] FFmpeg process closed with code ${code}`);
+        
+        const currentActive = activeStreams.get(streamId);
+        if (!currentActive) return;
         
         // Capture exit code and analyze why it crashed
         if (code !== 0 && code !== null) {
           const reason = analyzeCrashReason(errorLines, code);
-          liveStreamState.lastCrashReason = reason;
-          console.error(`[Live Stream] FFmpeg crash detected. Diagnostic: ${reason}`);
+          currentActive.state.lastCrashReason = reason;
+          console.error(`[Live Stream] [${streamId}] FFmpeg crash detected. Diagnostic: ${reason}`);
         }
 
         // If we were using COPY and it closed almost instantly, auto-retry with TRANSCODE
-        if (useCopy && liveStreamState.isLive && (Date.now() - (liveStreamState.startTime || 0) < 4000)) {
-          console.warn("[Live Stream] Stream COPY failed or closed instantly. Auto-recovering using high-compatibility TRANSCODE mode...");
-          liveStreamProcess = spawnFFmpeg(resolvedUrl, resolvedAudioUrl, false);
+        if (useCopy && currentActive.state.isLive && (Date.now() - (currentActive.state.startTime || 0) < 4000)) {
+          console.warn(`[Live Stream] [${streamId}] Stream COPY failed or closed instantly. Auto-recovering using high-compatibility TRANSCODE mode...`);
+          const newProc = spawnFFmpeg(streamId, resolvedUrl, resolvedAudioUrl, false);
+          currentActive.process = newProc;
         } else {
-          liveStreamProcess = null;
-          liveStreamState.isLive = false;
-          liveStreamState.startTime = null;
+          currentActive.process = null;
+          currentActive.state.isLive = false;
+          currentActive.state.startTime = null;
+          activeStreams.delete(streamId);
+          
+          // Sync with Firestore: update status to 'ended' and set endedAt
+          try {
+            await getFirestore().collection("live_streams").doc(streamId).update({
+              status: "ended",
+              endedAt: new Date().toISOString()
+            });
+            console.log(`[Live Stream] [${streamId}] Firestore updated to ended.`);
+          } catch (fireErr) {
+            console.error(`[Live Stream] [${streamId}] Error updating Firestore status to ended:`, fireErr);
+          }
         }
       });
       
       proc.on("error", (err: any) => {
-        if (transitioningToMock) {
-          return;
-        }
-        console.log("[Live Stream] FFmpeg process error event:", err);
+        console.log(`[Live Stream] [${streamId}] FFmpeg process error event:`, err);
         const reason = err.message || "FFmpeg spawn error or execution failure.";
-        liveStreamState.lastCrashReason = reason;
+        
+        const currentActive = activeStreams.get(streamId);
+        if (!currentActive) return;
+        currentActive.state.lastCrashReason = reason;
         
         if (useCopy) {
-          console.warn("[Live Stream] Stream COPY error. Auto-recovering using high-compatibility TRANSCODE mode...");
-          liveStreamProcess = spawnFFmpeg(resolvedUrl, resolvedAudioUrl, false);
+          console.warn(`[Live Stream] [${streamId}] Stream COPY error. Auto-recovering using high-compatibility TRANSCODE mode...`);
+          const newProc = spawnFFmpeg(streamId, resolvedUrl, resolvedAudioUrl, false);
+          currentActive.process = newProc;
         } else {
-          liveStreamProcess = null;
-          liveStreamState.isLive = false;
-          liveStreamState.startTime = null;
+          currentActive.process = null;
+          currentActive.state.isLive = false;
+          currentActive.state.startTime = null;
+          activeStreams.delete(streamId);
         }
       });
       
       return proc;
     }
 
+    const streamId = "stream-" + Date.now() + "-" + Math.random().toString(36).substring(2, 8);
+    const activeVideoTitle = videoTitle || (isYt ? "YouTube Stream" : isDrive ? "Google Drive Video" : "Gallery Video");
     const streamToken = "stream-" + Date.now() + "-" + Math.random().toString(36).substring(2, 10);
 
-    liveStreamState = {
+    // Save metadata to Firestore
+    const liveStreamData = {
+      streamId,
+      userId,
+      videoSource: videoSource,
+      rtmpUrl: rtmpUrl,
+      title: activeVideoTitle,
+      status: "live",
+      createdAt: new Date().toISOString(),
+    };
+    await getFirestore().collection("live_streams").doc(streamId).set(liveStreamData);
+
+    // Register active stream
+    const streamState: StreamState = {
+      streamId,
+      userId,
       isLive: true,
       startTime: Date.now(),
       videoSource: videoSource,
       rtmpUrl: rtmpUrl,
       streamKey: streamKey,
-      activeVideoTitle: videoTitle || (isYt ? "YouTube Stream" : isDrive ? "Google Drive Video" : "Gallery Video"),
-      streamToken: streamToken,
+      activeVideoTitle,
+      streamToken,
       errorLog: [],
       lastCrashReason: "",
     };
-    
-    liveStreamProcess = spawnFFmpeg(resolvedVideoUrl, resolvedAudioUrl, false);
+
+    activeStreams.set(streamId, {
+      process: null,
+      state: streamState,
+    });
+
+    const proc = spawnFFmpeg(streamId, resolvedVideoUrl, resolvedAudioUrl, false);
+    const activeObj = activeStreams.get(streamId);
+    if (activeObj) {
+      activeObj.process = proc;
+    }
+
+    // Wait to see if it spawns and doesn't crash immediately in the first 1000ms
+    const spawnPromise = new Promise<void>((resolve, reject) => {
+      let completed = false;
+      const cleanup = () => {
+        proc.off("error", onError);
+        proc.off("exit", onExit);
+      };
+
+      const onError = (err: any) => {
+        if (!completed) {
+          completed = true;
+          cleanup();
+          reject(new Error(`FFmpeg failed to start: ${err.message}`));
+        }
+      };
+
+      const onExit = (code: number | null) => {
+        if (!completed) {
+          completed = true;
+          cleanup();
+          const reason = (activeObj?.state.errorLog && activeObj.state.errorLog.length > 0)
+            ? activeObj.state.errorLog.slice(-5).join("\n")
+            : (activeObj?.state.lastCrashReason || "FFmpeg exited early.");
+          reject(new Error(`FFmpeg exited early with code ${code}. Diagnostics:\n${reason}`));
+        }
+      };
+
+      proc.on("error", onError);
+      proc.on("exit", onExit);
+
+      setTimeout(() => {
+        if (!completed) {
+          completed = true;
+          cleanup();
+          resolve();
+        }
+      }, 1000); // 1000ms verification window
+    });
+
+    try {
+      await spawnPromise;
+    } catch (spawnErr: any) {
+      // Cleanup registered active stream
+      activeStreams.delete(streamId);
+      // Update Firestore status
+      try {
+        await getFirestore().collection("live_streams").doc(streamId).set({
+          streamId,
+          userId,
+          videoSource,
+          rtmpUrl,
+          title: activeVideoTitle,
+          status: "failed",
+          createdAt: liveStreamData.createdAt,
+          endedAt: new Date().toISOString(),
+          error: spawnErr.message
+        });
+      } catch (dbErr) {}
+      throw spawnErr;
+    }
     
     res.json({
       success: true,
-      message: "Background restreaming started successfully!",
-      status: liveStreamState
+      message: "Background restreaming started successfully and is verified running!",
+      streamId,
+      status: streamState
     });
     
   } catch (error: any) {
     console.error("[Live Stream] Failed to start live restream:", error);
     res.status(500).json({ error: error.message || "Failed to launch streaming loop" });
+  } finally {
+    if (cookiesPath && fs.existsSync(cookiesPath)) {
+      try {
+        fs.unlinkSync(cookiesPath);
+        console.log(`[Live Stream] Cleaned up temporary cookies file in finally block: ${cookiesPath}`);
+      } catch (e) {}
+    }
   }
 });
 

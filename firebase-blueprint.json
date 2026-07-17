@@ -71,6 +71,46 @@
         }
       },
       "required": ["id", "userId", "video_title", "video_url", "aspectRatio", "createdAt"]
+    },
+    "LiveStream": {
+      "title": "LiveStream",
+      "description": "Active or ended multi-stream live loops",
+      "type": "object",
+      "properties": {
+        "streamId": {
+          "type": "string",
+          "description": "Unique id of the stream"
+        },
+        "videoSource": {
+          "type": "string",
+          "description": "Original input video or stream url"
+        },
+        "rtmpUrl": {
+          "type": "string",
+          "description": "Target RTMP ingestion server URL"
+        },
+        "title": {
+          "type": "string",
+          "description": "Stream title"
+        },
+        "userId": {
+          "type": "string",
+          "description": "The UID of the creator who started the stream"
+        },
+        "status": {
+          "type": "string",
+          "description": "Current state of the stream (live or ended)"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp of creation in ISO string format"
+        },
+        "endedAt": {
+          "type": "string",
+          "description": "Timestamp of stream termination in ISO string format"
+        }
+      },
+      "required": ["streamId", "videoSource", "rtmpUrl", "title", "userId", "status", "createdAt"]
     }
   },
   "firestore": {
@@ -81,6 +121,10 @@
     "compiled_videos/{compiledVideoId}": {
       "schema": "CompiledVideo",
       "description": "User compiled/completed shorts renders"
+    },
+    "live_streams/{streamId}": {
+      "schema": "LiveStream",
+      "description": "Multi-stream active processes and public directories"
     }
   }
 }
